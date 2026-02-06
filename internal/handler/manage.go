@@ -1548,12 +1548,26 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
 		}
 
-		// Success if at least one operation succeeded
-		if runtimeErr != nil && configErr != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound: runtime=%v, config=%v", runtimeErr, configErr))
+		// Success if config operation succeeded (runtime removal is optional)
+		// The inbound might not exist in runtime if Xray wasn't restarted after config change
+		if configErr != nil {
+			// Config file operation failed
+			if runtimeErr != nil {
+				// Both failed - check if it's just "not found" errors
+				if strings.Contains(runtimeErr.Error(), "not enough information") {
+					// Xray says the inbound doesn't exist in runtime, which is fine
+					// Just report config error
+					writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound from config: %v", configErr))
+				} else {
+					writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound: runtime=%v, config=%v", runtimeErr, configErr))
+				}
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound from config: %v", configErr))
+			}
 			return
 		}
 
+		// Config succeeded, runtime error is acceptable (inbound might not be loaded)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Inbound removed successfully",
