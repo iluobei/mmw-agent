@@ -8,6 +8,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const AgentUserAgent = "miaomiaowux/0.1"
+
 // Config holds the agent configuration
 type Config struct {
 	MasterURL             string        `yaml:"master_url"`

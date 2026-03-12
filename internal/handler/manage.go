@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"mmw-agent/internal/config"
 	"mmw-agent/internal/xrpc"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
@@ -31,8 +32,12 @@ func NewManageHandler(configToken string) *ManageHandler {
 	}
 }
 
-// authenticate checks if the request is authorized
+// authenticate checks if the request is authorized (token + User-Agent)
 func (h *ManageHandler) authenticate(r *http.Request) bool {
+	if r.Header.Get("User-Agent") != config.AgentUserAgent {
+		return false
+	}
+
 	if h.configToken == "" {
 		return true
 	}

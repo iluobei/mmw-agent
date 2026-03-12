@@ -32,6 +32,19 @@ type CertResult struct {
 	ExpiryDate time.Time
 }
 
+// CertRequest contains all parameters for a certificate request.
+type CertRequest struct {
+	Email          string
+	Domain         string
+	Provider       string
+	ChallengeMode  string
+	WebrootPath    string
+	DNSProvider    string
+	DNSCredentials map[string]string
+	EABKid         string
+	EABHmacKey     string
+}
+
 // User implements the acme.User interface for lego.
 type User struct {
 	Email        string
@@ -54,22 +67,18 @@ type Client struct {
 // ClientOption configures the Client.
 type ClientOption func(*Client)
 
-// WithCertDir sets the certificate storage directory.
 func WithCertDir(dir string) ClientOption {
 	return func(c *Client) { c.certDir = dir }
 }
 
-// WithStaging enables the Let's Encrypt staging environment.
 func WithStaging(staging bool) ClientOption {
 	return func(c *Client) { c.staging = staging }
 }
 
-// WithHTTPPort sets the port for HTTP-01 challenge (default: ":80").
 func WithHTTPPort(port string) ClientOption {
 	return func(c *Client) { c.httpPort = port }
 }
 
-// WithWebrootDir sets the webroot directory for webroot challenge mode.
 func WithWebrootDir(dir string) ClientOption {
 	return func(c *Client) { c.webrootDir = dir }
 }
@@ -87,32 +96,62 @@ func NewClient(opts ...ClientOption) *Client {
 	return c
 }
 
-// ObtainCertificate requests a new certificate for the given domain.
+// ObtainCertificate requests a new certificate (backward-compatible HTTP-01 only).
 func (c *Client) ObtainCertificate(ctx context.Context, email, domain string, useWebroot bool) (*CertResult, error) {
-	if email == "" {
+	mode := "standalone"
+	if useWebroot {
+		mode = "webroot"
+	}
+	return c.ObtainCertificateV2(ctx, CertRequest{
+		Email:         email,
+		Domain:        domain,
+		Provider:      CALetsEncrypt,
+		ChallengeMode: mode,
+		WebrootPath:   c.webrootDir,
+	})
+}
+
+// ObtainCertificateV2 requests a new certificate with full options support.
+func (c *Client) ObtainCertificateV2(ctx context.Context, req CertRequest) (*CertResult, error) {
+	if req.Email == "" {
 		return nil, errors.New("email is required")
 	}
-	if domain == "" {
+	if req.Domain == "" {
 		return nil, errors.New("domain is required")
 	}
 
-	// Generate a new private key for the user
+	client, err := c.buildLegoClient(req)
+	if err != nil {
+		return nil, err
+	}
+
+	obtainReq := certificate.ObtainRequest{
+		Domains: []string{req.Domain},
+		Bundle:  true,
+	}
+
+	certificates, err := client.Certificate.Obtain(obtainReq)
+	if err != nil {
+		return nil, fmt.Errorf("obtain certificate: %w", err)
+	}
+
+	return c.processCertResult(req.Domain, certificates.Certificate, certificates.PrivateKey)
+}
+
+func (c *Client) buildLegoClient(req CertRequest) (*lego.Client, error) {
 	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate private key: %w", err)
 	}
 
-	user := &User{
-		Email: email,
-		key:   privateKey,
-	}
+	user := &User{Email: req.Email, key: privateKey}
 
 	config := lego.NewConfig(user)
-	if c.staging {
-		config.CADirURL = lego.LEDirectoryStaging
-	} else {
-		config.CADirURL = lego.LEDirectoryProduction
+	provider := req.Provider
+	if provider == "" {
+		provider = CALetsEncrypt
 	}
+	config.CADirURL = ResolveCADirectoryURL(provider, c.staging)
 	config.Certificate.KeyType = certcrypto.EC256
 
 	client, err := lego.NewClient(config)
@@ -120,52 +159,93 @@ func (c *Client) ObtainCertificate(ctx context.Context, email, domain string, us
 		return nil, fmt.Errorf("create lego client: %w", err)
 	}
 
-	// Set up HTTP-01 challenge provider
-	if useWebroot && c.webrootDir != "" {
-		// Webroot mode: write challenge files to the specified directory
-		provider, err := NewWebrootProvider(c.webrootDir)
-		if err != nil {
-			return nil, fmt.Errorf("create webroot provider: %w", err)
+	switch req.ChallengeMode {
+	case "dns":
+		if err := c.setupDNSChallenge(client, req); err != nil {
+			return nil, err
 		}
-		if err := client.Challenge.SetHTTP01Provider(provider); err != nil {
-			return nil, fmt.Errorf("set webroot provider: %w", err)
+	case "webroot":
+		if err := c.setupWebrootChallenge(client, req); err != nil {
+			return nil, err
 		}
-	} else {
-		// Standalone mode: lego starts its own HTTP server
-		provider := http01.NewProviderServer("", c.httpPort)
-		if err := client.Challenge.SetHTTP01Provider(provider); err != nil {
+	default:
+		p := http01.NewProviderServer("", c.httpPort)
+		if err := client.Challenge.SetHTTP01Provider(p); err != nil {
 			return nil, fmt.Errorf("set http01 provider: %w", err)
 		}
 	}
 
-	// Register the user
-	reg, err := client.Registration.Register(registration.RegisterOptions{
-		TermsOfServiceAgreed: true,
-	})
+	regOpts := registration.RegisterOptions{TermsOfServiceAgreed: true}
+	if req.EABKid != "" && req.EABHmacKey != "" {
+		reg, err := client.Registration.RegisterWithExternalAccountBinding(registration.RegisterEABOptions{
+			TermsOfServiceAgreed: true,
+			Kid:                  req.EABKid,
+			HmacEncoded:         req.EABHmacKey,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("register with EAB: %w", err)
+		}
+		user.Registration = reg
+	} else {
+		reg, err := client.Registration.Register(regOpts)
+		if err != nil {
+			return nil, fmt.Errorf("register with ACME: %w", err)
+		}
+		user.Registration = reg
+	}
+
+	return client, nil
+}
+
+func (c *Client) setupDNSChallenge(client *lego.Client, req CertRequest) error {
+	if req.DNSProvider == "" {
+		return errors.New("dns_provider is required for DNS-01 challenge")
+	}
+
+	if len(req.DNSCredentials) > 0 {
+		cleanup, err := SetDNSCredentialEnv(req.DNSProvider, req.DNSCredentials)
+		if err != nil {
+			return fmt.Errorf("set DNS credentials: %w", err)
+		}
+		defer cleanup()
+	}
+
+	provider, err := NewDNSProviderByName(req.DNSProvider)
 	if err != nil {
-		return nil, fmt.Errorf("register with ACME: %w", err)
-	}
-	user.Registration = reg
-
-	// Request the certificate
-	request := certificate.ObtainRequest{
-		Domains: []string{domain},
-		Bundle:  true,
+		return fmt.Errorf("create DNS provider %s: %w", req.DNSProvider, err)
 	}
 
-	certificates, err := client.Certificate.Obtain(request)
+	if err := client.Challenge.SetDNS01Provider(provider); err != nil {
+		return fmt.Errorf("set DNS-01 provider: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) setupWebrootChallenge(client *lego.Client, req CertRequest) error {
+	webrootDir := req.WebrootPath
+	if webrootDir == "" {
+		webrootDir = c.webrootDir
+	}
+	if webrootDir == "" {
+		return errors.New("webroot_path is required for webroot challenge")
+	}
+	provider, err := NewWebrootProvider(webrootDir)
 	if err != nil {
-		return nil, fmt.Errorf("obtain certificate: %w", err)
+		return fmt.Errorf("create webroot provider: %w", err)
 	}
+	if err := client.Challenge.SetHTTP01Provider(provider); err != nil {
+		return fmt.Errorf("set webroot provider: %w", err)
+	}
+	return nil
+}
 
-	// Parse the certificate to get expiry date
-	expiryDate, issueDate, err := parseCertificateDates(certificates.Certificate)
+func (c *Client) processCertResult(domain string, certPEMBytes, keyPEMBytes []byte) (*CertResult, error) {
+	expiryDate, issueDate, err := parseCertificateDates(certPEMBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse certificate: %w", err)
 	}
 
-	// Save the certificate to disk
-	certPath, keyPath, err := c.saveCertificate(domain, certificates.Certificate, certificates.PrivateKey)
+	certPath, keyPath, err := c.saveCertificate(domain, certPEMBytes, keyPEMBytes)
 	if err != nil {
 		return nil, fmt.Errorf("save certificate: %w", err)
 	}
@@ -174,15 +254,14 @@ func (c *Client) ObtainCertificate(ctx context.Context, email, domain string, us
 		Domain:     domain,
 		CertPath:   certPath,
 		KeyPath:    keyPath,
-		CertPEM:    string(certificates.Certificate),
-		KeyPEM:     string(certificates.PrivateKey),
+		CertPEM:    string(certPEMBytes),
+		KeyPEM:     string(keyPEMBytes),
 		IssueDate:  issueDate,
 		ExpiryDate: expiryDate,
 	}, nil
 }
 
 func (c *Client) saveCertificate(domain string, certPEM, keyPEM []byte) (string, string, error) {
-	// Ensure directory exists
 	domainDir := filepath.Join(c.certDir, domain)
 	if err := os.MkdirAll(domainDir, 0700); err != nil {
 		return "", "", fmt.Errorf("create cert directory: %w", err)
@@ -191,12 +270,9 @@ func (c *Client) saveCertificate(domain string, certPEM, keyPEM []byte) (string,
 	certPath := filepath.Join(domainDir, "fullchain.pem")
 	keyPath := filepath.Join(domainDir, "privkey.pem")
 
-	// Write certificate
 	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
 		return "", "", fmt.Errorf("write certificate: %w", err)
 	}
-
-	// Write private key with restrictive permissions
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
 		return "", "", fmt.Errorf("write private key: %w", err)
 	}

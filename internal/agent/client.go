@@ -71,6 +71,31 @@ func NewClient(cfg *config.Config) *Client {
 	}
 }
 
+// wsHeaders returns HTTP headers for WebSocket handshake
+func (c *Client) wsHeaders() http.Header {
+	h := http.Header{}
+	h.Set("User-Agent", config.AgentUserAgent)
+	return h
+}
+
+// newRequest creates an HTTP request with standard headers (Content-Type, Authorization, User-Agent)
+func (c *Client) newRequest(ctx context.Context, method, urlStr string, body []byte) (*http.Request, error) {
+	var req *http.Request
+	var err error
+	if body != nil {
+		req, err = http.NewRequestWithContext(ctx, method, urlStr, bytes.NewReader(body))
+	} else {
+		req, err = http.NewRequestWithContext(ctx, method, urlStr, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.config.Token)
+	req.Header.Set("User-Agent", config.AgentUserAgent)
+	return req, nil
+}
+
 // Start starts the agent client with automatic mode selection
 func (c *Client) Start(ctx context.Context) {
 	log.Printf("[Agent] Starting in %s mode", c.config.ConnectionMode)
@@ -234,7 +259,7 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	conn, _, err := dialer.DialContext(ctx, u.String(), nil)
+	conn, _, err := dialer.DialContext(ctx, u.String(), c.wsHeaders())
 	if err != nil {
 		return err
 	}
@@ -529,7 +554,7 @@ func (c *Client) tryWebSocketOnce(ctx context.Context) error {
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	conn, _, err := dialer.DialContext(ctx, u.String(), nil)
+	conn, _, err := dialer.DialContext(ctx, u.String(), c.wsHeaders())
 	if err != nil {
 		return err
 	}
@@ -545,12 +570,10 @@ func (c *Client) tryHTTPOnce(ctx context.Context) bool {
 	}
 	u.Path = "/api/remote/heartbeat"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader([]byte("{}")))
+	req, err := c.newRequest(ctx, http.MethodPost, u.String(), []byte("{}"))
 	if err != nil {
 		return false
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -636,12 +659,10 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 	}
 	u.Path = "/api/remote/traffic"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	req, err := c.newRequest(ctx, http.MethodPost, u.String(), payload)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -674,12 +695,10 @@ func (c *Client) sendSpeedHTTP(ctx context.Context) error {
 	}
 	u.Path = "/api/remote/speed"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	req, err := c.newRequest(ctx, http.MethodPost, u.String(), payload)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -711,12 +730,10 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 	}
 	u.Path = "/api/remote/heartbeat"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(payload))
+	req, err := c.newRequest(ctx, http.MethodPost, u.String(), payload)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.config.Token)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -904,17 +921,32 @@ func (e *AuthError) IsTokenInvalid() bool {
 const (
 	WSMsgTypeCertRequest = "cert_request"
 	WSMsgTypeCertUpdate  = "cert_update"
+	WSMsgTypeCertDeploy  = "cert_deploy"
 	WSMsgTypeTokenUpdate = "token_update"
 )
 
 // WSCertRequestPayload represents a certificate request from master
 type WSCertRequestPayload struct {
-	CertID        int64  `json:"cert_id"`
-	Domain        string `json:"domain"`
-	Email         string `json:"email"`
-	Provider      string `json:"provider"`
-	ChallengeMode string `json:"challenge_mode"`
-	WebrootPath   string `json:"webroot_path,omitempty"`
+	CertID         int64  `json:"cert_id"`
+	Domain         string `json:"domain"`
+	Email          string `json:"email"`
+	Provider       string `json:"provider"`
+	ChallengeMode  string `json:"challenge_mode"`
+	WebrootPath    string `json:"webroot_path,omitempty"`
+	DNSProvider    string `json:"dns_provider,omitempty"`
+	DNSCredentials string `json:"dns_credentials,omitempty"` // JSON string
+	EABKid         string `json:"eab_kid,omitempty"`
+	EABHmacKey     string `json:"eab_hmac_key,omitempty"`
+}
+
+// WSCertDeployPayload represents a certificate deploy command from master
+type WSCertDeployPayload struct {
+	Domain   string `json:"domain"`
+	CertPEM  string `json:"cert_pem"`
+	KeyPEM   string `json:"key_pem"`
+	CertPath string `json:"cert_path"`
+	KeyPath  string `json:"key_path"`
+	Reload   string `json:"reload"`
 }
 
 // WSCertUpdatePayload represents a certificate update response to master
@@ -957,6 +989,13 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			return
 		}
 		go c.handleCertRequest(conn, payload)
+	case WSMsgTypeCertDeploy:
+		var payload WSCertDeployPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[Agent] Failed to parse cert_deploy payload: %v", err)
+			return
+		}
+		go c.handleCertDeploy(payload)
 	case WSMsgTypeTokenUpdate:
 		var payload WSTokenUpdatePayload
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -1000,7 +1039,6 @@ func (c *Client) requestCertificate(req WSCertRequestPayload) WSCertUpdatePayloa
 		Domain: req.Domain,
 	}
 
-	// Create ACME client with appropriate options
 	opts := []acme.ClientOption{}
 	if req.ChallengeMode == "webroot" && req.WebrootPath != "" {
 		opts = append(opts, acme.WithWebrootDir(req.WebrootPath))
@@ -1008,14 +1046,30 @@ func (c *Client) requestCertificate(req WSCertRequestPayload) WSCertUpdatePayloa
 
 	acmeClient := acme.NewClient(opts...)
 
-	// Determine if we should use webroot mode
-	useWebroot := req.ChallengeMode == "webroot" && req.WebrootPath != ""
+	// Build V2 cert request
+	certReq := acme.CertRequest{
+		Email:         req.Email,
+		Domain:        req.Domain,
+		Provider:      req.Provider,
+		ChallengeMode: req.ChallengeMode,
+		WebrootPath:   req.WebrootPath,
+		DNSProvider:   req.DNSProvider,
+		EABKid:        req.EABKid,
+		EABHmacKey:    req.EABHmacKey,
+	}
 
-	// Request the certificate
+	// Parse DNS credentials from JSON string
+	if req.DNSCredentials != "" {
+		var creds map[string]string
+		if err := json.Unmarshal([]byte(req.DNSCredentials), &creds); err == nil {
+			certReq.DNSCredentials = creds
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	certResult, err := acmeClient.ObtainCertificate(ctx, req.Email, req.Domain, useWebroot)
+	certResult, err := acmeClient.ObtainCertificateV2(ctx, certReq)
 	if err != nil {
 		result.Success = false
 		result.Error = err.Error()
@@ -1033,6 +1087,17 @@ func (c *Client) requestCertificate(req WSCertRequestPayload) WSCertUpdatePayloa
 
 	log.Printf("[Agent] Certificate obtained for %s, expires: %s", req.Domain, certResult.ExpiryDate)
 	return result
+}
+
+// handleCertDeploy deploys a certificate received from master
+func (c *Client) handleCertDeploy(payload WSCertDeployPayload) {
+	log.Printf("[Agent] Received cert_deploy for domain: %s, target: %s", payload.Domain, payload.Reload)
+
+	if err := acme.Deploy(payload.CertPEM, payload.KeyPEM, payload.CertPath, payload.KeyPath, payload.Reload); err != nil {
+		log.Printf("[Agent] cert_deploy failed for %s: %v", payload.Domain, err)
+	} else {
+		log.Printf("[Agent] cert_deploy succeeded for %s", payload.Domain)
+	}
 }
 
 // handleTokenUpdate processes a token update from master

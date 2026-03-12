@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"mmw-agent/internal/agent"
+	"mmw-agent/internal/config"
 )
 
 // APIHandler handles API requests from the master server (for pull mode)
@@ -86,8 +87,12 @@ func (h *APIHandler) ServeSpeedHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// authenticate checks if the request is authorized
+// authenticate checks if the request is authorized (token + User-Agent)
 func (h *APIHandler) authenticate(r *http.Request) bool {
+	if r.Header.Get("User-Agent") != config.AgentUserAgent {
+		return false
+	}
+
 	if h.configToken == "" {
 		return true
 	}
