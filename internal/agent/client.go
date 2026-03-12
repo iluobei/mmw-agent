@@ -115,6 +115,10 @@ func (c *Client) Start(ctx context.Context) {
 	case ModePull:
 		c.setCurrentMode(ModePull)
 		log.Printf("[Agent] Pull mode enabled - API will be served at /api/child/traffic and /api/child/speed")
+		// Report agent info immediately via HTTP heartbeat
+		if err := c.sendHeartbeatHTTP(ctx); err != nil {
+			log.Printf("[Agent] Failed to send initial heartbeat in pull mode: %v", err)
+		}
 
 	case ModeAuto:
 		fallthrough
@@ -227,10 +231,14 @@ func (c *Client) runWebSocket(ctx context.Context) {
 	}
 }
 
-// calculateBackoff calculates the reconnection backoff duration
+// calculateBackoff calculates the reconnection backoff duration with exponential increase
 func (c *Client) calculateBackoff() time.Duration {
 	c.reconnects++
-	backoff := time.Duration(c.reconnects) * 5 * time.Second
+	// Exponential backoff: 5s, 10s, 20s, 40s, 80s, 160s, 300s(cap)
+	backoff := 5 * time.Second
+	for i := 1; i < c.reconnects && backoff < 5*time.Minute; i++ {
+		backoff *= 2
+	}
 	if backoff > 5*time.Minute {
 		backoff = 5 * time.Minute
 	}
@@ -287,6 +295,11 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 	c.wsMu.Unlock()
 
 	log.Printf("[Agent] Connected and authenticated")
+
+	// Report agent info (listen_port) immediately after connection
+	if err := c.sendHeartbeat(conn); err != nil {
+		log.Printf("[Agent] Failed to send initial heartbeat: %v", err)
+	}
 
 	return c.runMessageLoop(ctx, conn)
 }
@@ -487,6 +500,7 @@ func (c *Client) runAutoMode(ctx context.Context) {
 
 // runAutoModeLoop is the internal loop for auto mode fallback
 func (c *Client) runAutoModeLoop(ctx context.Context) {
+	autoRetries := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -508,6 +522,7 @@ func (c *Client) runAutoModeLoop(ctx context.Context) {
 				log.Printf("[Agent] WebSocket disconnected: %v", err)
 			}
 			c.reconnects = 0
+			autoRetries = 0
 			continue
 		} else {
 			log.Printf("[Agent] WebSocket failed: %v, trying HTTP...", err)
@@ -520,13 +535,25 @@ func (c *Client) runAutoModeLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
+			autoRetries = 0
 			continue
 		}
 
 		c.setCurrentMode(ModePull)
 		log.Printf("[Agent] Falling back to pull mode - API available at /api/child/traffic and /api/child/speed")
+		c.sendHeartbeatHTTP(ctx)
 
-		c.runPullModeWithTrafficReport(ctx, 30*time.Second)
+		// Exponential backoff for pull mode: 30s, 60s, 120s, 240s, 300s(cap)
+		autoRetries++
+		pullDuration := 30 * time.Second
+		for i := 1; i < autoRetries && pullDuration < 5*time.Minute; i++ {
+			pullDuration *= 2
+		}
+		if pullDuration > 5*time.Minute {
+			pullDuration = 5 * time.Minute
+		}
+
+		c.runPullModeWithTrafficReport(ctx, pullDuration)
 
 		if ctx.Err() != nil {
 			return
@@ -603,6 +630,7 @@ func (c *Client) runHTTPReporterLoop(ctx context.Context) {
 	defer speedTicker.Stop()
 	defer heartbeatTicker.Stop()
 
+	c.sendHeartbeatHTTP(ctx)
 	c.sendTrafficHTTP(ctx)
 	c.sendSpeedHTTP(ctx)
 

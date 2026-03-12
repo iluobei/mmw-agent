@@ -115,7 +115,7 @@ func (c *Config) applyDefaults() {
 		c.ConnectionMode = "auto"
 	}
 	if c.ListenPort == "" {
-		c.ListenPort = "8081"
+		c.ListenPort = "23889"
 	}
 	if c.TrafficReportInterval == 0 {
 		c.TrafficReportInterval = 1 * time.Minute
