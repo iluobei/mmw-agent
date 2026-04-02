@@ -17,14 +17,27 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "Path to config file")
+	configPathShort := flag.String("c", "", "Path to config file (shorthand)")
 	flag.Parse()
+
+	// -c takes effect if -config is not set
+	cfgFile := *configPath
+	if cfgFile == "" {
+		cfgFile = *configPathShort
+	}
+	// Default to config.yaml in working directory
+	if cfgFile == "" {
+		if _, err := os.Stat("config.yaml"); err == nil {
+			cfgFile = "config.yaml"
+		}
+	}
 
 	// Load configuration
 	var cfg *config.Config
 	var err error
 
-	if *configPath != "" {
-		cfg, err = config.Load(*configPath)
+	if cfgFile != "" {
+		cfg, err = config.Load(cfgFile)
 		if err != nil {
 			log.Fatalf("Failed to load config: %v", err)
 		}

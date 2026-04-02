@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"mmw-agent/internal/config"
@@ -19,6 +20,8 @@ import (
 	"github.com/xtls/xray-core/app/proxyman/command"
 	"github.com/xtls/xray-core/infra/conf"
 )
+
+var nginxInstalling atomic.Bool
 
 // ManageHandler handles management API requests for child servers
 type ManageHandler struct {
@@ -163,7 +166,14 @@ func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 func (h *ManageHandler) getNginxStatus() *ServiceStatus {
 	status := &ServiceStatus{}
 
+	// Check PATH first, then compiled install path
 	nginxPath, err := exec.LookPath("nginx")
+	if err != nil {
+		if _, statErr := os.Stat("/usr/local/nginx/sbin/nginx"); statErr == nil {
+			nginxPath = "/usr/local/nginx/sbin/nginx"
+			err = nil
+		}
+	}
 	if err == nil {
 		status.Installed = true
 		cmd := exec.Command(nginxPath, "-v")
@@ -171,6 +181,10 @@ func (h *ManageHandler) getNginxStatus() *ServiceStatus {
 		if err == nil {
 			status.Version = strings.TrimSpace(string(output))
 		}
+	}
+
+	if nginxInstalling.Load() {
+		status.Version = "安装中..."
 	}
 
 	// Check systemctl first
@@ -716,37 +730,35 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	log.Printf("[Manage] Installing Nginx...")
-
-	var cmd *exec.Cmd
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		cmd = exec.Command("bash", "-c", "apt-get update && apt-get install -y nginx")
-	} else if _, err := exec.LookPath("yum"); err == nil {
-		cmd = exec.Command("bash", "-c", "yum install -y nginx")
-	} else if _, err := exec.LookPath("dnf"); err == nil {
-		cmd = exec.Command("bash", "-c", "dnf install -y nginx")
-	} else {
-		writeError(w, http.StatusInternalServerError, "No supported package manager found")
+	if nginxInstalling.Load() {
+		writeError(w, http.StatusConflict, "Nginx installation already in progress")
 		return
 	}
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	log.Printf("[Manage] Starting Nginx installation (async)...")
+	nginxInstalling.Store(true)
 
-	err := cmd.Run()
-	if err != nil {
-		log.Printf("[Manage] Nginx installation failed: %v, stderr: %s", err, stderr.String())
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Installation failed: %v", err))
-		return
-	}
+	go func() {
+		defer nginxInstalling.Store(false)
 
-	log.Printf("[Manage] Nginx installed successfully")
+		cmd := exec.Command("bash", "-c",
+			`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash`)
+		cmd.Env = os.Environ()
+
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		if err := cmd.Run(); err != nil {
+			log.Printf("[Manage] Nginx installation failed: %v, stderr: %s", err, stderr.String())
+			return
+		}
+		log.Printf("[Manage] Nginx installed successfully")
+	}()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
-		"message": "Nginx installed successfully",
-		"output":  stdout.String(),
+		"message": "Nginx installation started, please check status later",
 	})
 }
 
@@ -764,19 +776,9 @@ func (h *ManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.Request
 
 	log.Printf("[Manage] Removing Nginx...")
 
-	exec.Command("systemctl", "stop", "nginx").Run()
-
-	var cmd *exec.Cmd
-	if _, err := exec.LookPath("apt-get"); err == nil {
-		cmd = exec.Command("bash", "-c", "apt-get remove -y nginx nginx-common")
-	} else if _, err := exec.LookPath("yum"); err == nil {
-		cmd = exec.Command("bash", "-c", "yum remove -y nginx")
-	} else if _, err := exec.LookPath("dnf"); err == nil {
-		cmd = exec.Command("bash", "-c", "dnf remove -y nginx")
-	} else {
-		writeError(w, http.StatusInternalServerError, "No supported package manager found")
-		return
-	}
+	cmd := exec.Command("bash", "-c",
+		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/uninstall-nginx.sh | bash -s -- -y`)
+	cmd.Env = os.Environ()
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -794,7 +796,6 @@ func (h *ManageHandler) HandleNginxRemove(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "Nginx removed successfully",
-		"output":  stdout.String(),
 	})
 }
 
