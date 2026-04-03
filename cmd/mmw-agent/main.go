@@ -89,6 +89,12 @@ func main() {
 	mux.HandleFunc("/api/child/scan", manageHandler.HandleScan)
 	mux.HandleFunc("/api/child/cert/deploy", manageHandler.HandleCertDeploy)
 
+	// SSE streaming install/remove
+	mux.HandleFunc("/api/child/xray/install-stream", manageHandler.HandleXrayInstallStream)
+	mux.HandleFunc("/api/child/xray/remove-stream", manageHandler.HandleXrayRemoveStream)
+	mux.HandleFunc("/api/child/nginx/install-stream", manageHandler.HandleNginxInstallStream)
+	mux.HandleFunc("/api/child/nginx/remove-stream", manageHandler.HandleNginxRemoveStream)
+
 	// Health check
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -96,12 +102,11 @@ func main() {
 		w.Write([]byte(`{"status":"ok","mode":"` + string(agentClient.GetCurrentMode()) + `"}`))
 	})
 
-	// Create HTTP server
+	// Create HTTP server (no WriteTimeout — SSE streaming needs long-lived connections)
 	server := &http.Server{
-		Addr:         ":" + cfg.ListenPort,
-		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		Addr:        ":" + cfg.ListenPort,
+		Handler:     mux,
+		ReadTimeout: 30 * time.Second,
 	}
 
 	// Setup graceful shutdown

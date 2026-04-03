@@ -1,16 +1,19 @@
 package handler
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -2497,4 +2500,149 @@ func runCommand(name string, args ...string) error {
 		return fmt.Errorf("%s: %s: %w", name, string(output), err)
 	}
 	return nil
+}
+
+// ================== SSE Streaming Install/Remove ==================
+
+func sseStreamCmd(w http.ResponseWriter, r *http.Request, cmd *exec.Cmd, completeMsg string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		sseEvent(w, flusher, map[string]string{"type": "error", "message": err.Error()})
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		sseEvent(w, flusher, map[string]string{"type": "error", "message": err.Error()})
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		sseEvent(w, flusher, map[string]string{"type": "error", "message": err.Error()})
+		return
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	scanStream := func(rc io.ReadCloser) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(rc)
+		scanner.Buffer(make([]byte, 256*1024), 256*1024)
+		for scanner.Scan() {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
+			mu.Lock()
+			sseEvent(w, flusher, map[string]string{"type": "output", "data": scanner.Text()})
+			mu.Unlock()
+		}
+	}
+
+	go scanStream(stdout)
+	go scanStream(stderr)
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		wg.Wait()
+		if err != nil {
+			sseEvent(w, flusher, map[string]string{"type": "error", "message": err.Error()})
+		} else {
+			sseEvent(w, flusher, map[string]interface{}{"type": "complete", "success": true, "message": completeMsg})
+		}
+	case <-r.Context().Done():
+		cmd.Process.Kill()
+		sseEvent(w, flusher, map[string]string{"type": "error", "message": "request cancelled"})
+	}
+}
+
+func sseEvent(w http.ResponseWriter, flusher http.Flusher, data interface{}) {
+	b, _ := json.Marshal(data)
+	fmt.Fprintf(w, "data: %s\n\n", b)
+	flusher.Flush()
+}
+
+func (h *ManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	log.Printf("[Manage] Starting Xray install (stream)...")
+	cmd := exec.CommandContext(r.Context(), "bash", "-c",
+		`bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install`)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Xray installed successfully")
+}
+
+func (h *ManageHandler) HandleXrayRemoveStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	log.Printf("[Manage] Starting Xray remove (stream)...")
+	cmd := exec.CommandContext(r.Context(), "bash", "-c",
+		`bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove`)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Xray removed successfully")
+}
+
+func (h *ManageHandler) HandleNginxInstallStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	if nginxInstalling.Load() {
+		writeError(w, http.StatusConflict, "Nginx installation already in progress")
+		return
+	}
+	nginxInstalling.Store(true)
+	defer nginxInstalling.Store(false)
+	log.Printf("[Manage] Starting Nginx install (stream)...")
+	cmd := exec.CommandContext(r.Context(), "bash", "-c",
+		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash`)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Nginx installed successfully")
+}
+
+func (h *ManageHandler) HandleNginxRemoveStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	log.Printf("[Manage] Starting Nginx remove (stream)...")
+	cmd := exec.CommandContext(r.Context(), "bash", "-c",
+		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/uninstall-nginx.sh | bash -s -- -y`)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Nginx removed successfully")
 }
