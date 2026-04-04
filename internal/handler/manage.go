@@ -2483,16 +2483,25 @@ func deployCertFiles(certPEM, keyPEM, certPath, keyPath, reloadTarget string) er
 
 	switch reloadTarget {
 	case "nginx":
-		return runCommand("nginx", "-s", "reload")
+		return reloadNginx()
 	case "xray":
 		return runCommand("systemctl", "restart", "xray")
 	case "both":
-		if err := runCommand("nginx", "-s", "reload"); err != nil {
+		if err := reloadNginx(); err != nil {
 			return err
 		}
 		return runCommand("systemctl", "restart", "xray")
 	}
 	return nil
+}
+
+func reloadNginx() error {
+	for _, bin := range []string{"/usr/local/nginx/sbin/nginx", "nginx"} {
+		if path, err := exec.LookPath(bin); err == nil {
+			return runCommand(path, "-s", "reload")
+		}
+	}
+	return runCommand("systemctl", "reload", "nginx")
 }
 
 func runCommand(name string, args ...string) error {
