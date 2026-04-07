@@ -2574,6 +2574,40 @@ func deployNginxSSLConfig(domain string) {
 	log.Printf("[Manage] Nginx SSL config deployed for domain %s at %s", domain, sslConfPath)
 }
 
+// HandleNginxSetupSSL handles POST /api/child/nginx/setup-ssl
+// Deploys SSL 443 server block for a domain without reinstalling nginx.
+func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req struct {
+		Domain string `json:"domain"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Domain == "" {
+		writeError(w, http.StatusBadRequest, "domain is required")
+		return
+	}
+
+	domain := strings.ToLower(strings.TrimSpace(req.Domain))
+	deployNginxSSLConfig(domain)
+
+	// Reload nginx to apply
+	if err := reloadNginx(); err != nil {
+		log.Printf("[Manage] Nginx reload after setup-ssl failed: %v", err)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("SSL config deployed for %s", domain),
+	})
+}
+
 func reloadNginx() error {
 	for _, bin := range []string{"/usr/local/nginx/sbin/nginx", "nginx"} {
 		if path, err := exec.LookPath(bin); err == nil {

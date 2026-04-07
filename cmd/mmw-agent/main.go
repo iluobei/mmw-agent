@@ -88,6 +88,7 @@ func main() {
 	mux.HandleFunc("/api/child/routing", manageHandler.HandleRouting)
 	mux.HandleFunc("/api/child/scan", manageHandler.HandleScan)
 	mux.HandleFunc("/api/child/cert/deploy", manageHandler.HandleCertDeploy)
+	mux.HandleFunc("/api/child/nginx/setup-ssl", manageHandler.HandleNginxSetupSSL)
 	mux.HandleFunc("/api/child/domains/latency", manageHandler.HandleDomainLatencyProbe)
 
 	// SSE streaming install/remove
