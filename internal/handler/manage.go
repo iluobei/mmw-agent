@@ -741,6 +741,11 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	var req struct {
+		Domain string `json:"domain"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
 	log.Printf("[Manage] Starting Nginx installation (async)...")
 	nginxInstalling.Store(true)
 
@@ -760,6 +765,10 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		log.Printf("[Manage] Nginx installed successfully")
+
+		if req.Domain != "" {
+			deployNginxSSLConfig(req.Domain)
+		}
 	}()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2498,6 +2507,73 @@ func deployCertFiles(certPEM, keyPEM, certPath, keyPath, reloadTarget string) er
 	return nil
 }
 
+func deployNginxSSLConfig(domain string) {
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return
+	}
+
+	confDir := "/usr/local/nginx/conf"
+	if _, err := os.Stat(confDir); err != nil {
+		confDir = "/etc/nginx"
+	}
+
+	certDir := filepath.Join(confDir, "cert")
+	os.MkdirAll(certDir, 0755)
+
+	serverBlock := fmt.Sprintf(`server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name %s;
+    ssl_certificate  cert/%s.pem;
+    ssl_certificate_key cert/%s.key;
+    ssl_session_timeout 5m;
+    ssl_ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE:ECDH:AES:HIGH:!NULL:!aNULL:!MD5:!ADH:!RC4;
+    ssl_protocols TLSv1 TLSv1.1 TLSv1.2;
+
+    location / {
+        root /usr/local/nginx/html;
+        index index.html;
+    }
+}
+`, domain, domain, domain)
+
+	// Write to conf.d or append via include
+	confDDir := filepath.Join(confDir, "conf.d")
+	os.MkdirAll(confDDir, 0755)
+	sslConfPath := filepath.Join(confDDir, "ssl.conf")
+
+	if err := os.WriteFile(sslConfPath, []byte(serverBlock), 0644); err != nil {
+		log.Printf("[Manage] Failed to write nginx SSL config: %v", err)
+		return
+	}
+
+	// Ensure main nginx.conf includes conf.d/*.conf
+	mainConf := filepath.Join(confDir, "nginx.conf")
+	content, err := os.ReadFile(mainConf)
+	if err != nil {
+		log.Printf("[Manage] Failed to read nginx.conf: %v", err)
+		return
+	}
+
+	includeDirective := "include conf.d/*.conf;"
+	if !strings.Contains(string(content), includeDirective) {
+		// Insert include before the last closing brace of http block
+		text := string(content)
+		lastBrace := strings.LastIndex(text, "}")
+		if lastBrace > 0 {
+			text = text[:lastBrace] + "    " + includeDirective + "\n" + text[lastBrace:]
+			if err := os.WriteFile(mainConf, []byte(text), 0644); err != nil {
+				log.Printf("[Manage] Failed to update nginx.conf with include: %v", err)
+				return
+			}
+		}
+	}
+
+	log.Printf("[Manage] Nginx SSL config deployed for domain %s at %s", domain, sslConfPath)
+}
+
 func reloadNginx() error {
 	for _, bin := range []string{"/usr/local/nginx/sbin/nginx", "nginx"} {
 		if path, err := exec.LookPath(bin); err == nil {
@@ -2664,11 +2740,18 @@ func (h *ManageHandler) HandleNginxInstallStream(w http.ResponseWriter, r *http.
 	}
 	nginxInstalling.Store(true)
 	defer nginxInstalling.Store(false)
+
+	domain := r.URL.Query().Get("domain")
+
 	log.Printf("[Manage] Starting Nginx install (stream)...")
 	cmd := exec.CommandContext(r.Context(), "bash", "-c",
 		`curl -fsSL https://raw.githubusercontent.com/iluobei/miaomiaowuX/main/install-nginx.sh | bash`)
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Nginx installed successfully")
+
+	if domain != "" {
+		deployNginxSSLConfig(domain)
+	}
 }
 
 func (h *ManageHandler) HandleNginxRemoveStream(w http.ResponseWriter, r *http.Request) {
