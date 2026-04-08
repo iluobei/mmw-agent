@@ -2575,7 +2575,7 @@ func deployNginxSSLConfig(domain string) {
 }
 
 // HandleNginxSetupSSL handles POST /api/child/nginx/setup-ssl
-// Deploys full nginx.conf (if provided) or SSL 443 server block for a domain.
+// Deploys nginx.conf + domain server block to servers/{domain}.conf.
 func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -2587,8 +2587,9 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	}
 
 	var req struct {
-		Domain      string `json:"domain"`
-		NginxConfig string `json:"nginx_config"`
+		Domain       string `json:"domain"`
+		NginxConfig  string `json:"nginx_config"`
+		DomainConfig string `json:"domain_config"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Domain == "" {
 		writeError(w, http.StatusBadRequest, "domain is required")
@@ -2597,32 +2598,38 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 
+	confDir := "/usr/local/nginx"
+	if _, err := os.Stat(confDir); err != nil {
+		confDir = "/etc/nginx"
+	}
+
+	// Ensure cert and servers directories exist
+	os.MkdirAll(filepath.Join(confDir, "cert"), 0755)
+	os.MkdirAll(filepath.Join(confDir, "servers"), 0755)
+
 	if req.NginxConfig != "" {
-		// Full nginx.conf provided by master — write it directly
-		confDir := "/usr/local/nginx/conf"
-		if _, err := os.Stat(confDir); err != nil {
-			confDir = "/etc/nginx"
-		}
-
-		// Ensure cert and servers directories exist
-		os.MkdirAll(filepath.Join(confDir, "cert"), 0755)
-		os.MkdirAll(filepath.Join(confDir, "servers"), 0755)
-
+		// Deploy base nginx.conf
 		mainConf := filepath.Join(confDir, "nginx.conf")
-
-		// Backup existing config
 		if content, err := os.ReadFile(mainConf); err == nil {
-			backupPath := mainConf + ".bak." + time.Now().Format("20060102150405")
-			os.WriteFile(backupPath, content, 0644)
+			os.WriteFile(mainConf+".bak."+time.Now().Format("20060102150405"), content, 0644)
 		}
-
 		if err := os.WriteFile(mainConf, []byte(req.NginxConfig), 0644); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to write nginx.conf: %v", err))
 			return
 		}
-		log.Printf("[Manage] Full nginx.conf deployed for domain %s at %s", domain, mainConf)
+		log.Printf("[Manage] nginx.conf deployed at %s", mainConf)
+	}
+
+	if req.DomainConfig != "" {
+		// Deploy domain-specific server block to servers/{domain}.conf
+		domainConfPath := filepath.Join(confDir, "servers", domain+".conf")
+		if err := os.WriteFile(domainConfPath, []byte(req.DomainConfig), 0644); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to write domain config: %v", err))
+			return
+		}
+		log.Printf("[Manage] Domain config deployed at %s", domainConfPath)
 	} else {
-		// Fallback: legacy behavior — generate SSL server block snippet
+		// Fallback: legacy behavior
 		deployNginxSSLConfig(domain)
 	}
 
