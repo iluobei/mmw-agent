@@ -2575,7 +2575,7 @@ func deployNginxSSLConfig(domain string) {
 }
 
 // HandleNginxSetupSSL handles POST /api/child/nginx/setup-ssl
-// Deploys SSL 443 server block for a domain without reinstalling nginx.
+// Deploys full nginx.conf (if provided) or SSL 443 server block for a domain.
 func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -2587,7 +2587,8 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	}
 
 	var req struct {
-		Domain string `json:"domain"`
+		Domain      string `json:"domain"`
+		NginxConfig string `json:"nginx_config"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Domain == "" {
 		writeError(w, http.StatusBadRequest, "domain is required")
@@ -2595,7 +2596,35 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	}
 
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
-	deployNginxSSLConfig(domain)
+
+	if req.NginxConfig != "" {
+		// Full nginx.conf provided by master — write it directly
+		confDir := "/usr/local/nginx/conf"
+		if _, err := os.Stat(confDir); err != nil {
+			confDir = "/etc/nginx"
+		}
+
+		// Ensure cert and servers directories exist
+		os.MkdirAll(filepath.Join(confDir, "cert"), 0755)
+		os.MkdirAll(filepath.Join(confDir, "servers"), 0755)
+
+		mainConf := filepath.Join(confDir, "nginx.conf")
+
+		// Backup existing config
+		if content, err := os.ReadFile(mainConf); err == nil {
+			backupPath := mainConf + ".bak." + time.Now().Format("20060102150405")
+			os.WriteFile(backupPath, content, 0644)
+		}
+
+		if err := os.WriteFile(mainConf, []byte(req.NginxConfig), 0644); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to write nginx.conf: %v", err))
+			return
+		}
+		log.Printf("[Manage] Full nginx.conf deployed for domain %s at %s", domain, mainConf)
+	} else {
+		// Fallback: legacy behavior — generate SSL server block snippet
+		deployNginxSSLConfig(domain)
+	}
 
 	// Reload nginx to apply
 	if err := reloadNginx(); err != nil {
