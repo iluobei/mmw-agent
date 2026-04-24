@@ -2265,15 +2265,6 @@ func (h *ManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 		modified = true
 	}
 
-	if _, ok := config["metrics"]; !ok {
-		config["metrics"] = map[string]interface{}{
-			"tag":    "Metrics",
-			"listen": constants.DefaultMetricsListen,
-		}
-		result.AddedSections = append(result.AddedSections, "metrics")
-		modified = true
-	}
-
 	if !h.hasAPIInbound(config) {
 		h.addAPIInbound(config)
 		result.AddedSections = append(result.AddedSections, "api_inbound")
