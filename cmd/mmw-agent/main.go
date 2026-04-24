@@ -77,7 +77,7 @@ func main() {
 	// 创建 HTTP 服务（不设置 WriteTimeout，避免影响 SSE 长连接）
 	server := &http.Server{
 		Addr:        ":" + cfg.ListenPort,
-		Handler:     mux,
+		Handler:     handler.SilentAuthMiddleware(cfg.Token, mux),
 		ReadTimeout: constants.DefaultReadTimeout,
 	}
 
