@@ -912,12 +912,13 @@ func (c *Client) getSystemNetworkStats() (rxBytes, txBytes int64) {
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Inter") || strings.HasPrefix(line, "face") || strings.HasPrefix(line, "lo:") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
 			continue
 		}
 
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
+		iface := strings.TrimSpace(parts[0])
+		if !isPhysicalInterface(iface) {
 			continue
 		}
 
@@ -935,6 +936,21 @@ func (c *Client) getSystemNetworkStats() (rxBytes, txBytes int64) {
 	}
 
 	return rxBytes, txBytes
+}
+
+var virtualInterfacePrefixes = []string{
+	"lo", "docker", "veth", "br-", "virbr", "vnet",
+	"flannel", "cni", "calico", "tunl", "wg",
+	"tailscale", "tun", "tap", "dummy",
+}
+
+func isPhysicalInterface(name string) bool {
+	for _, prefix := range virtualInterfacePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // AuthError 表示鉴权失败错误。
