@@ -2624,6 +2624,61 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	})
 }
 
+func (h *ManageHandler) HandleValidateSite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req struct {
+		SiteType  string `json:"site_type"`
+		SiteValue string `json:"site_value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SiteValue == "" {
+		writeError(w, http.StatusBadRequest, "site_value is required")
+		return
+	}
+
+	switch req.SiteType {
+	case "static":
+		indexPath := filepath.Join(req.SiteValue, "index.html")
+		if _, err := os.Stat(indexPath); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success": false,
+				"message": fmt.Sprintf("index.html not found at %s", req.SiteValue),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"message": "index.html exists",
+		})
+	case "proxy":
+		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "5", req.SiteValue)
+		out, err := cmd.Output()
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success": false,
+				"message": fmt.Sprintf("connection failed: %v", err),
+			})
+			return
+		}
+		code := strings.TrimSpace(string(out))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"success": true,
+			"message": fmt.Sprintf("HTTP %s", code),
+		})
+	default:
+		writeError(w, http.StatusBadRequest, "site_type must be 'static' or 'proxy'")
+	}
+}
+
 func reloadNginx() error {
 	for _, bin := range constants.NginxBinarySearchPaths {
 		if path, err := exec.LookPath(bin); err == nil {
