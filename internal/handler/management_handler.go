@@ -2888,3 +2888,68 @@ func (h *ManageHandler) HandleNginxRemoveStream(w http.ResponseWriter, r *http.R
 	cmd.Env = os.Environ()
 	sseStreamCmd(w, r, cmd, "Nginx removed successfully")
 }
+
+func (h *ManageHandler) HandleAgentUpgradeStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	log.Printf("[Manage] Starting Agent upgrade (stream)...")
+	script := `
+set -e
+echo "=========================================="
+echo "  MMW-Agent Upgrade"
+echo "=========================================="
+
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64)  ARCH_NAME="amd64" ;;
+    aarch64|arm64) ARCH_NAME="arm64" ;;
+    *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
+RELEASE_URL="https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+echo "Downloading from $RELEASE_URL..."
+wget -q --show-progress -O /tmp/mmw-agent-new "$RELEASE_URL" || curl -fsSL -o /tmp/mmw-agent-new "$RELEASE_URL"
+
+chmod +x /tmp/mmw-agent-new
+echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"
+
+echo ""
+echo "Scheduling delayed replacement and restart..."
+nohup bash -c "sleep 2 && cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent && systemctl restart mmw-agent && rm -f /tmp/mmw-agent-new" >/dev/null 2>&1 &
+echo "Agent will restart in a few seconds."
+`
+	cmd := exec.CommandContext(r.Context(), "bash", "-c", script)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Agent upgrade scheduled, restarting shortly")
+}
+
+func (h *ManageHandler) HandleAgentUninstallStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	log.Printf("[Manage] Starting Agent uninstall (stream)...")
+	script := `
+set -e
+echo "=========================================="
+echo "  MMW-Agent Uninstall"
+echo "=========================================="
+
+echo "Scheduling delayed uninstall..."
+nohup bash -c 'sleep 2 && systemctl stop mmw-agent && systemctl disable mmw-agent && rm -f /usr/local/bin/mmw-agent && rm -f /etc/systemd/system/mmw-agent.service && systemctl daemon-reload && rm -rf /etc/mmw-agent /var/lib/mmw-agent && echo "Agent uninstalled"' >/dev/null 2>&1 &
+echo "Agent will be uninstalled in a few seconds."
+`
+	cmd := exec.CommandContext(r.Context(), "bash", "-c", script)
+	cmd.Env = os.Environ()
+	sseStreamCmd(w, r, cmd, "Agent uninstall scheduled")
+}

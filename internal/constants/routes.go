@@ -30,10 +30,12 @@ const (
 )
 
 const (
-	PathChildXrayInstallStream = "/api/child/xray/install-stream"
-	PathChildXrayRemoveStream  = "/api/child/xray/remove-stream"
-	PathChildNginxInstallSSE   = "/api/child/nginx/install-stream"
-	PathChildNginxRemoveSSE    = "/api/child/nginx/remove-stream"
+	PathChildXrayInstallStream    = "/api/child/xray/install-stream"
+	PathChildXrayRemoveStream     = "/api/child/xray/remove-stream"
+	PathChildNginxInstallSSE      = "/api/child/nginx/install-stream"
+	PathChildNginxRemoveSSE       = "/api/child/nginx/remove-stream"
+	PathChildAgentUpgradeStream   = "/api/child/agent/upgrade-stream"
+	PathChildAgentUninstallStream = "/api/child/agent/uninstall-stream"
 )
 
 const (

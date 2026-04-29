@@ -39,4 +39,6 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildXrayRemoveStream, manageHandler.HandleXrayRemoveStream)
 	mux.HandleFunc(constants.PathChildNginxInstallSSE, manageHandler.HandleNginxInstallStream)
 	mux.HandleFunc(constants.PathChildNginxRemoveSSE, manageHandler.HandleNginxRemoveStream)
+	mux.HandleFunc(constants.PathChildAgentUpgradeStream, manageHandler.HandleAgentUpgradeStream)
+	mux.HandleFunc(constants.PathChildAgentUninstallStream, manageHandler.HandleAgentUninstallStream)
 }
