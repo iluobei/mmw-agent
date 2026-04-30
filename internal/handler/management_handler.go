@@ -2750,6 +2750,17 @@ func (h *ManageHandler) HandleClearStreamPort(w http.ResponseWriter, r *http.Req
 	}
 
 	if len(removed) > 0 {
+		// 从 nginx.conf 中移除 stream 块
+		nginxConfPath := filepath.Join(constants.NginxPrimaryPrefixDir, "nginx.conf")
+		if confData, err := os.ReadFile(nginxConfPath); err == nil {
+			conf := string(confData)
+			streamBlock := "\nstream {\n    include stream_servers/*.conf;\n}\n"
+			if cleaned := strings.Replace(conf, streamBlock, "\n", 1); cleaned != conf {
+				os.WriteFile(nginxConfPath, []byte(cleaned), 0644)
+				log.Printf("[Manage] Removed stream block from nginx.conf")
+			}
+		}
+
 		if err := reloadNginx(); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("removed %d files but nginx reload failed: %v", len(removed), err))
 			return
