@@ -48,6 +48,8 @@ type Client struct {
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
 
+	startTime time.Time // 进程启动时间（固定不变，用于重启检测）
+
 	// 连接状态
 	currentMode   ConnectionMode
 	httpClient    *http.Client
@@ -68,6 +70,7 @@ func NewClient(cfg *config.Config) *Client {
 		collector:   collector.NewCollector(),
 		xrayServers: cfg.XrayServers,
 		stopCh:      make(chan struct{}),
+		startTime:   time.Now(),
 		httpClient: &http.Client{
 			Timeout: constants.DefaultHTTPClientTimeout,
 		},
@@ -440,11 +443,11 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 
 // 发送心跳消息。
 func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
-	now := time.Now()
 	listenPort, _ := strconv.Atoi(c.config.ListenPort)
 	payload, _ := json.Marshal(map[string]interface{}{
-		"boot_time":   now,
+		"boot_time":   c.startTime,
 		"listen_port": listenPort,
+		"local_time":  time.Now().Unix(),
 	})
 
 	msg := map[string]interface{}{
@@ -752,11 +755,11 @@ func (c *Client) sendSpeedHTTP(ctx context.Context) error {
 
 // 通过 HTTP POST 发送心跳。
 func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
-	now := time.Now()
 	listenPort, _ := strconv.Atoi(c.config.ListenPort)
 	payload, _ := json.Marshal(map[string]interface{}{
-		"boot_time":   now,
+		"boot_time":   c.startTime.Unix(),
 		"listen_port": listenPort,
+		"local_time":  time.Now().Unix(),
 	})
 
 	u, err := url.Parse(c.config.MasterURL)
@@ -779,6 +782,15 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var hbResp struct {
+		ServerTime int64 `json:"server_time"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&hbResp); err == nil && hbResp.ServerTime > 0 {
+		if drift := time.Now().Unix() - hbResp.ServerTime; drift > 10 || drift < -10 {
+			log.Printf("[Agent] Clock drift detected: local time is %+ds from master", drift)
+		}
 	}
 
 	return nil
@@ -975,6 +987,7 @@ const (
 	WSMsgTypeScanResult          = "scan_result"
 	WSMsgTypeDomainLatencyProbe  = "domain_latency_probe"
 	WSMsgTypeDomainLatencyResult = "domain_latency_result"
+	WSMsgTypeHeartbeatAck        = "heartbeat_ack"
 )
 
 // WSCertDeployPayload 是主控端下发的证书部署指令。
@@ -1034,6 +1047,15 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			return
 		}
 		go c.handleDomainLatencyProbe(conn, payload)
+	case WSMsgTypeHeartbeatAck:
+		var payload struct {
+			ServerTime int64 `json:"server_time"`
+		}
+		if err := json.Unmarshal(msg.Payload, &payload); err == nil && payload.ServerTime > 0 {
+			if drift := time.Now().Unix() - payload.ServerTime; drift > 10 || drift < -10 {
+				log.Printf("[Agent] Clock drift detected: local time is %+ds from master", drift)
+			}
+		}
 	default:
 		// 忽略未知消息类型
 	}
