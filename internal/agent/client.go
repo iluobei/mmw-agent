@@ -22,6 +22,9 @@ import (
 	"mmw-agent/internal/collector"
 	"mmw-agent/internal/config"
 	"mmw-agent/internal/constants"
+	"mmw-agent/internal/discovery"
+	"mmw-agent/internal/xrayconf"
+	"mmw-agent/internal/xrayctl"
 
 	"github.com/gorilla/websocket"
 )
@@ -1093,12 +1096,12 @@ func deployCert(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
 	case "nginx":
 		return reloadNginxCmd()
 	case "xray":
-		return runCmd("systemctl", "restart", "xray")
+		return xrayctl.RestartXray("auto", "")
 	case "both":
 		if err := reloadNginxCmd(); err != nil {
 			return err
 		}
-		return runCmd("systemctl", "restart", "xray")
+		return xrayctl.RestartXray("auto", "")
 	}
 	return nil
 }
@@ -1328,29 +1331,22 @@ func (c *Client) sendScanResult(conn *websocket.Conn) {
 		xrayRunning = true
 	}
 
-	// 从配置读取入站列表
+	// 从配置读取入站列表（使用 3-tier 发现）
 	var inbounds []map[string]interface{}
-	configPaths := constants.DefaultXrayConfigPaths
-	for _, cfgPath := range configPaths {
-		data, err := os.ReadFile(cfgPath)
-		if err != nil {
-			continue
-		}
-		var config map[string]interface{}
-		if json.Unmarshal(data, &config) != nil {
-			continue
-		}
-		if ibs, ok := config["inbounds"].([]interface{}); ok {
-			for _, ib := range ibs {
-				if m, ok := ib.(map[string]interface{}); ok {
-					if tag, _ := m["tag"].(string); tag == "api" {
-						continue
+	paths := discovery.Discover()
+	if paths.ConfigPath != "" || paths.ConfDir != "" {
+		if cfg, err := xrayconf.ReadConfig(paths.ConfigPath, paths.ConfDir); err == nil {
+			if ibs, ok := cfg["inbounds"].([]interface{}); ok {
+				for _, ib := range ibs {
+					if m, ok := ib.(map[string]interface{}); ok {
+						if tag, _ := m["tag"].(string); tag == "api" {
+							continue
+						}
+						inbounds = append(inbounds, m)
 					}
-					inbounds = append(inbounds, m)
 				}
 			}
 		}
-		break
 	}
 
 	payload, _ := json.Marshal(map[string]interface{}{

@@ -1,11 +1,12 @@
 package config
 
 import (
+	"log"
 	"os"
-	"strconv"
 	"time"
 
 	"mmw-agent/internal/constants"
+	"mmw-agent/internal/discovery"
 
 	"gopkg.in/yaml.v3"
 )
@@ -21,12 +22,15 @@ type Config struct {
 	XrayServers           []XrayServer  `yaml:"xray_servers"`
 	TrafficReportInterval time.Duration `yaml:"traffic_report_interval"`
 	SpeedReportInterval   time.Duration `yaml:"speed_report_interval"`
+	RestartMethod         string        `yaml:"restart_method"`
+	RestartCommand        string        `yaml:"restart_command"`
 }
 
 // XrayServer 表示本机 Xray 节点配置。
 type XrayServer struct {
 	Name       string `yaml:"name"`
 	ConfigPath string `yaml:"config_path"`
+	ConfDir    string `yaml:"conf_dir"`
 }
 
 // DefaultXrayConfigPaths 是默认的 Xray 配置搜索路径。
@@ -44,9 +48,7 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
-	// 补齐默认值
 	config.applyDefaults()
-
 	return &config, nil
 }
 
@@ -57,16 +59,18 @@ func FromEnv() *Config {
 		Token:          os.Getenv("MMWX_TOKEN"),
 		ConnectionMode: os.Getenv("MMWX_CONNECTION_MODE"),
 		ListenPort:     os.Getenv("MMWX_LISTEN_PORT"),
+		RestartMethod:  os.Getenv("MMWX_RESTART_METHOD"),
+		RestartCommand: os.Getenv("MMWX_RESTART_COMMAND"),
 	}
 
-	// 读取 Xray 配置路径
 	if xrayConfig := os.Getenv("MMWX_XRAY_CONFIG"); xrayConfig != "" {
-		config.XrayServers = []XrayServer{
-			{Name: "primary", ConfigPath: xrayConfig},
+		server := XrayServer{Name: "primary", ConfigPath: xrayConfig}
+		if confDir := os.Getenv("MMWX_XRAY_CONFDIR"); confDir != "" {
+			server.ConfDir = confDir
 		}
+		config.XrayServers = []XrayServer{server}
 	}
 
-	// 读取上报间隔
 	if interval := os.Getenv("MMWX_TRAFFIC_INTERVAL"); interval != "" {
 		if d, err := time.ParseDuration(interval); err == nil {
 			config.TrafficReportInterval = d
@@ -105,6 +109,12 @@ func (c *Config) Merge(env *Config) {
 	if env.SpeedReportInterval > 0 {
 		c.SpeedReportInterval = env.SpeedReportInterval
 	}
+	if env.RestartMethod != "" {
+		c.RestartMethod = env.RestartMethod
+	}
+	if env.RestartCommand != "" {
+		c.RestartCommand = env.RestartCommand
+	}
 }
 
 // 为空字段填充默认值。
@@ -121,30 +131,32 @@ func (c *Config) applyDefaults() {
 	if c.SpeedReportInterval == 0 {
 		c.SpeedReportInterval = constants.DefaultSpeedReportInterval
 	}
+	if c.RestartMethod == "" {
+		c.RestartMethod = "auto"
+	}
 
-	// 未显式配置时自动探测 Xray 配置
 	if len(c.XrayServers) == 0 {
 		c.XrayServers = c.discoverXrayServers()
 	}
 }
 
-// 扫描默认路径中的 Xray 配置文件。
+// 通过 3-tier 方式发现 Xray 配置。
 func (c *Config) discoverXrayServers() []XrayServer {
-	var servers []XrayServer
-	for i, path := range DefaultXrayConfigPaths {
-		if _, err := os.Stat(path); err == nil {
-			servers = append(servers, XrayServer{
-				Name:       "xray-" + strconv.Itoa(i+1),
-				ConfigPath: path,
-			})
+	p := discovery.Discover()
+	if p.ConfigPath != "" || p.ConfDir != "" {
+		server := XrayServer{
+			Name:       "xray-1",
+			ConfigPath: p.ConfigPath,
+			ConfDir:    p.ConfDir,
 		}
+		log.Printf("[Config] Auto-discovered xray: config=%s confdir=%s", p.ConfigPath, p.ConfDir)
+		return []XrayServer{server}
 	}
-	return servers
+	return nil
 }
 
 // 校验配置是否合法。
 func (c *Config) Validate() error {
-	// 拉取模式之外通常需要 token
 	if c.ConnectionMode != constants.ConnectionModePull && c.Token == "" {
 		// 兼容空 token，实际仅拉取模式可正常工作
 	}

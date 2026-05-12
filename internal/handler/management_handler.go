@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"mmw-agent/internal/constants"
+	"mmw-agent/internal/discovery"
+	"mmw-agent/internal/xrayctl"
 	"mmw-agent/internal/xrpc"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
@@ -28,14 +30,23 @@ var nginxInstalling atomic.Bool
 
 // ManageHandler 处理子端管理接口请求。
 type ManageHandler struct {
-	configToken string
+	configToken    string
+	restartMethod  string
+	restartCommand string
 }
 
 // 创建管理处理器。
-func NewManageHandler(configToken string) *ManageHandler {
+func NewManageHandler(configToken, restartMethod, restartCommand string) *ManageHandler {
 	return &ManageHandler{
-		configToken: configToken,
+		configToken:    configToken,
+		restartMethod:  restartMethod,
+		restartCommand: restartCommand,
 	}
+}
+
+// RestartXray 使用配置的重启方式重启 xray。
+func (h *ManageHandler) RestartXray() error {
+	return xrayctl.RestartXray(h.restartMethod, h.restartCommand)
 }
 
 // 校验请求身份（token + User-Agent）。
@@ -254,11 +265,18 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	cmd := exec.Command("systemctl", req.Action, req.Service)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to %s %s: %v - %s", req.Action, req.Service, err, string(output)))
-		return
+	if req.Service == "xray" && req.Action == "restart" {
+		if err := h.RestartXray(); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to restart xray: %v", err))
+			return
+		}
+	} else {
+		cmd := exec.Command("systemctl", req.Action, req.Service)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to %s %s: %v - %s", req.Action, req.Service, err, string(output)))
+			return
+		}
 	}
 
 	log.Printf("[Manage] Service %s: %s", req.Service, req.Action)
@@ -655,8 +673,7 @@ func (h *ManageHandler) updateXraySystemConfig(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	cmd := exec.Command("systemctl", "restart", "xray")
-	if err := cmd.Run(); err != nil {
+	if err := h.RestartXray(); err != nil {
 		log.Printf("[Manage] Warning: failed to restart xray: %v", err)
 	}
 
@@ -1867,14 +1884,15 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 // ================== 辅助函数 ==================
 
 func (h *ManageHandler) findXrayConfigPath() string {
-	configPaths := constants.DefaultXrayConfigPaths
-
-	for _, p := range configPaths {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
+	p := discovery.Discover()
+	if p.ConfigPath != "" {
+		return p.ConfigPath
 	}
 	return ""
+}
+
+func (h *ManageHandler) findXrayConfigInfo() discovery.XrayPaths {
+	return discovery.Discover()
 }
 
 func (h *ManageHandler) findXrayAPIPort() int {
@@ -2153,8 +2171,7 @@ func (h *ManageHandler) HandleScan(w http.ResponseWriter, r *http.Request) {
 		response.ConfigModified = true
 		response.ConfigAddedSections = configResult.AddedSections
 		log.Printf("[Manage] Xray config auto-completed, added sections: %v", configResult.AddedSections)
-		cmd := exec.Command("systemctl", "restart", "xray")
-		if err := cmd.Run(); err != nil {
+		if err := h.RestartXray(); err != nil {
 			log.Printf("[Manage] Failed to restart xray after config update: %v", err)
 		} else {
 			log.Printf("[Manage] Xray restarted after config update")
@@ -2477,12 +2494,12 @@ func deployCertFiles(certPEM, keyPEM, certPath, keyPath, reloadTarget string) er
 	case "nginx":
 		return reloadNginx()
 	case "xray":
-		return runCommand("systemctl", "restart", "xray")
+		return xrayctl.RestartXray("auto", "")
 	case "both":
 		if err := reloadNginx(); err != nil {
 			return err
 		}
-		return runCommand("systemctl", "restart", "xray")
+		return xrayctl.RestartXray("auto", "")
 	}
 	return nil
 }
@@ -2783,7 +2800,7 @@ func (h *ManageHandler) deployDefaultXrayConfig() {
 		result := h.EnsureXrayConfig()
 		if result.Modified {
 			log.Printf("[Manage] Xray config updated after install: added %v", result.AddedSections)
-			exec.Command("systemctl", "restart", "xray").Run()
+			h.RestartXray()
 		}
 		return
 	}
@@ -2797,7 +2814,7 @@ func (h *ManageHandler) deployDefaultXrayConfig() {
 		return
 	}
 	log.Printf("[Manage] Deployed default xray config to %s", configPath)
-	exec.Command("systemctl", "restart", "xray").Run()
+	h.RestartXray()
 }
 
 // ================== SSE 流式安装/卸载 ==================
