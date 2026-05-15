@@ -2,103 +2,197 @@ package embedded
 
 import (
 	"log"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/xtls/xray-core/features/stats"
+	"mmw-agent/internal/limiter"
 )
 
-// AutoSpeedLimitConfig 自动限速配置（Master 下发）。
-type AutoSpeedLimitConfig struct {
-	Enable        bool   `json:"enable"`
-	Limit         uint64 `json:"limit"`          // 触发阈值 (Bytes/s)
-	WarnTimes     int    `json:"warn_times"`     // 连续超速次数触发
-	LimitSpeed    uint64 `json:"limit_speed"`    // 限速后速率 (Bytes/s)
-	LimitDuration int    `json:"limit_duration"` // 限速持续时间 (秒)
+type AutoSpeedLimitRule struct {
+	Type             string  `json:"type"`               // "sustained" | "burst"
+	ThresholdMbps    float64 `json:"threshold_mbps"`     // 触发阈值 (Mbps)
+	SustainedSeconds int     `json:"sustained_seconds"`  // sustained: 持续时长; burst: 单次最短时长
+	WindowSeconds    int     `json:"window_seconds"`     // burst: 时间窗口
+	BurstCount       int     `json:"burst_count"`        // burst: 窗口内触发次数
+	LimitMbps        float64 `json:"limit_mbps"`         // 限速后速率 (Mbps)
+	LimitDuration    int     `json:"limit_duration"`     // 限速持续时间 (秒)
 }
 
-// StartAutoSpeedMonitor 启动自动限速监控。
-func (e *EmbeddedXray) StartAutoSpeedMonitor(interval time.Duration, config AutoSpeedLimitConfig) {
-	if !config.Enable || config.Limit == 0 {
+type userSpeedState struct {
+	sustainedStart time.Time
+	burstEvents    []time.Time
+	limitedUntil   time.Time
+}
+
+type SpeedMonitor struct {
+	mu         sync.Mutex
+	rules      []AutoSpeedLimitRule
+	userState  map[string]*userSpeedState
+	userSpeeds map[string]int64 // email → Bytes/s
+	limiter    *limiter.Limiter
+}
+
+func NewSpeedMonitor() *SpeedMonitor {
+	return &SpeedMonitor{
+		userState:  make(map[string]*userSpeedState),
+		userSpeeds: make(map[string]int64),
+	}
+}
+
+func (m *SpeedMonitor) SetLimiter(l *limiter.Limiter) {
+	m.mu.Lock()
+	m.limiter = l
+	m.mu.Unlock()
+}
+
+func (m *SpeedMonitor) UpdateRules(rules []AutoSpeedLimitRule) {
+	m.mu.Lock()
+	m.rules = rules
+	m.mu.Unlock()
+}
+
+func (m *SpeedMonitor) GetUserSpeeds() map[string]int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make(map[string]int64, len(m.userSpeeds))
+	for k, v := range m.userSpeeds {
+		result[k] = v
+	}
+	return result
+}
+
+func (m *SpeedMonitor) Evaluate(userDeltas map[string]int64, elapsed time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if elapsed <= 0 {
 		return
 	}
-	if config.WarnTimes <= 0 {
-		config.WarnTimes = 3
+
+	now := time.Now()
+	secs := elapsed.Seconds()
+
+	for email := range m.userSpeeds {
+		delete(m.userSpeeds, email)
 	}
-	if config.LimitDuration <= 0 {
-		config.LimitDuration = 60
-	}
 
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
-		warnCount := make(map[string]int)
-		var mu sync.Mutex
-
-		for range ticker.C {
-			e.mu.RLock()
-			sm := e.statsManager
-			l := e.GetLimiter()
-			e.mu.RUnlock()
-
-			if sm == nil || l == nil {
-				continue
-			}
-
-			userTraffic := make(map[string]int64)
-			type counterLister interface {
-				VisitCounters(func(string, stats.Counter) bool)
-			}
-			if lister, ok := sm.(counterLister); ok {
-				lister.VisitCounters(func(name string, c stats.Counter) bool {
-					if !strings.HasPrefix(name, "user>>>") {
-						return true
-					}
-					parts := strings.Split(name, ">>>")
-					if len(parts) != 4 || parts[2] != "traffic" {
-						return true
-					}
-					email := parts[1]
-					value := c.Value()
-					userTraffic[email] += value
-					return true
-				})
-			}
-
-			threshold := int64(config.Limit) * int64(interval.Seconds())
-			mu.Lock()
-			for email, traffic := range userTraffic {
-				if traffic > threshold {
-					warnCount[email]++
-					if warnCount[email] >= config.WarnTimes {
-						log.Printf("[AutoLimit] User %s exceeded speed limit (%d times), applying temp limit %d Bytes/s for %ds",
-							email, warnCount[email], config.LimitSpeed, config.LimitDuration)
-
-						// Apply temporary speed limit across all inbounds
-						l.InboundInfo.Range(func(key, _ interface{}) bool {
-							tag := key.(string)
-							l.SetUserSpeed(tag, email, config.LimitSpeed)
-							return true
-						})
-
-						warnCount[email] = 0
-						emailCopy := email
-						time.AfterFunc(time.Duration(config.LimitDuration)*time.Second, func() {
-							l.InboundInfo.Range(func(key, _ interface{}) bool {
-								tag := key.(string)
-								l.SetUserSpeed(tag, emailCopy, 0) // restore
-								return true
-							})
-							log.Printf("[AutoLimit] User %s speed limit restored", emailCopy)
-						})
-					}
-				} else {
-					delete(warnCount, email)
-				}
-			}
-			mu.Unlock()
+	for email, delta := range userDeltas {
+		speed := int64(float64(delta) / secs)
+		if speed < 0 {
+			speed = 0
 		}
-	}()
+		m.userSpeeds[email] = speed
+	}
+
+	if len(m.rules) == 0 || m.limiter == nil {
+		return
+	}
+
+	for email, speed := range m.userSpeeds {
+		state := m.userState[email]
+		if state == nil {
+			state = &userSpeedState{}
+			m.userState[email] = state
+		}
+
+		if now.Before(state.limitedUntil) {
+			continue
+		}
+
+		for _, rule := range m.rules {
+			thresholdBytes := int64(rule.ThresholdMbps * 1000000 / 8)
+			exceeds := speed > thresholdBytes
+
+			switch rule.Type {
+			case "sustained":
+				m.evalSustained(email, state, rule, exceeds, now)
+			case "burst":
+				m.evalBurst(email, state, rule, exceeds, now, elapsed)
+			}
+
+			if now.Before(state.limitedUntil) {
+				break
+			}
+		}
+	}
+
+	for email, state := range m.userState {
+		if _, active := userDeltas[email]; !active {
+			if now.After(state.limitedUntil) {
+				delete(m.userState, email)
+			}
+		}
+	}
+}
+
+func (m *SpeedMonitor) evalSustained(email string, state *userSpeedState, rule AutoSpeedLimitRule, exceeds bool, now time.Time) {
+	if !exceeds {
+		state.sustainedStart = time.Time{}
+		return
+	}
+	if state.sustainedStart.IsZero() {
+		state.sustainedStart = now
+		return
+	}
+	if now.Sub(state.sustainedStart).Seconds() >= float64(rule.SustainedSeconds) {
+		m.applyLimit(email, state, rule, now)
+		state.sustainedStart = time.Time{}
+	}
+}
+
+func (m *SpeedMonitor) evalBurst(email string, state *userSpeedState, rule AutoSpeedLimitRule, exceeds bool, now time.Time, elapsed time.Duration) {
+	window := time.Duration(rule.WindowSeconds) * time.Second
+	minDuration := time.Duration(rule.SustainedSeconds) * time.Second
+
+	cutoff := now.Add(-window)
+	var kept []time.Time
+	for _, t := range state.burstEvents {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	state.burstEvents = kept
+
+	if exceeds {
+		if state.sustainedStart.IsZero() {
+			state.sustainedStart = now
+		}
+	} else {
+		if !state.sustainedStart.IsZero() && now.Sub(state.sustainedStart) >= minDuration {
+			state.burstEvents = append(state.burstEvents, now)
+		}
+		state.sustainedStart = time.Time{}
+	}
+
+	if len(state.burstEvents) >= rule.BurstCount {
+		m.applyLimit(email, state, rule, now)
+		state.burstEvents = nil
+		state.sustainedStart = time.Time{}
+	}
+}
+
+func (m *SpeedMonitor) applyLimit(email string, state *userSpeedState, rule AutoSpeedLimitRule, now time.Time) {
+	limitBytes := uint64(rule.LimitMbps * 1000000 / 8)
+	duration := time.Duration(rule.LimitDuration) * time.Second
+	state.limitedUntil = now.Add(duration)
+
+	l := m.limiter
+	l.InboundInfo.Range(func(key, _ interface{}) bool {
+		tag := key.(string)
+		l.SetUserSpeed(tag, email, limitBytes)
+		return true
+	})
+
+	log.Printf("[AutoLimit] User %s limited to %.0f Mbps for %ds (rule: %s, threshold: %.0f Mbps)",
+		email, rule.LimitMbps, rule.LimitDuration, rule.Type, rule.ThresholdMbps)
+
+	emailCopy := email
+	time.AfterFunc(duration, func() {
+		l.InboundInfo.Range(func(key, _ interface{}) bool {
+			tag := key.(string)
+			l.SetUserSpeed(tag, emailCopy, 0)
+			return true
+		})
+		log.Printf("[AutoLimit] User %s speed limit restored", emailCopy)
+	})
 }

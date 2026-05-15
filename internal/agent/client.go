@@ -71,6 +71,9 @@ type Client struct {
 	lastSampleTime time.Time
 	speedMu        sync.Mutex
 
+	// 流量采集时间（用于计算用户网速）
+	lastTrafficTime time.Time
+
 	// 嵌入模式
 	embeddedXray *embedded.EmbeddedXray
 
@@ -563,6 +566,7 @@ func (c *Client) runMessageLoop(ctx context.Context, conn *websocket.Conn) error
 
 // 采集并发送流量数据。
 func (c *Client) sendTrafficData(conn *websocket.Conn) error {
+	now := time.Now()
 	stats, err := c.collectLocalMetrics()
 	if err != nil {
 		log.Printf("[Agent] Failed to collect metrics: %v", err)
@@ -573,13 +577,25 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 		"stats": stats,
 	}
 
-	// 嵌入模式下附带在线设备信息
 	if c.embeddedXray != nil {
 		onlineUsers := c.collectOnlineUsers()
 		if len(onlineUsers) > 0 {
 			payloadMap["online_users"] = onlineUsers
 		}
+
+		if monitor := c.embeddedXray.GetSpeedMonitor(); monitor != nil && !c.lastTrafficTime.IsZero() {
+			elapsed := now.Sub(c.lastTrafficTime)
+			userDeltas := make(map[string]int64, len(stats.User))
+			for email, td := range stats.User {
+				userDeltas[email] = td.Uplink + td.Downlink
+			}
+			monitor.Evaluate(userDeltas, elapsed)
+			if speeds := monitor.GetUserSpeeds(); len(speeds) > 0 {
+				payloadMap["user_speeds"] = speeds
+			}
+		}
 	}
+	c.lastTrafficTime = now
 
 	payload, _ := json.Marshal(payloadMap)
 
@@ -1274,9 +1290,10 @@ type WSDomainLatencyProbePayload struct {
 
 // WSLimiterConfigPayload 是主控端下发的限速配置。
 type WSLimiterConfigPayload struct {
-	InboundTag string               `json:"inbound_tag"`
-	NodeLimit  uint64               `json:"node_limit"`
-	Users      []WSUserLimitInfo    `json:"users"`
+	InboundTag     string                       `json:"inbound_tag"`
+	NodeLimit      uint64                       `json:"node_limit"`
+	Users          []WSUserLimitInfo            `json:"users"`
+	AutoSpeedRules []embedded.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
 }
 
 // WSUserLimitInfo 是单个用户的限速和设备数配置。
@@ -1492,6 +1509,15 @@ func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
 	}
 
 	l.AddInboundLimiter(payload.InboundTag, payload.NodeLimit, users)
+
+	if monitor := c.embeddedXray.GetSpeedMonitor(); monitor != nil {
+		monitor.SetLimiter(l)
+		if len(payload.AutoSpeedRules) > 0 {
+			monitor.UpdateRules(payload.AutoSpeedRules)
+			log.Printf("[Agent] Updated auto speed rules: %d rules", len(payload.AutoSpeedRules))
+		}
+	}
+
 	log.Printf("[Agent] Updated limiter for inbound %s: %d users, node_limit=%d",
 		payload.InboundTag, len(users), payload.NodeLimit)
 }

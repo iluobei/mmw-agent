@@ -21,11 +21,19 @@ type EmbeddedXray struct {
 	instance     *core.Instance
 	dispatcher   *mydispatcher.Dispatcher
 	statsManager stats.Manager
+	speedMonitor *SpeedMonitor
 	mu           sync.RWMutex
 }
 
 func New(configPath string) *EmbeddedXray {
-	return &EmbeddedXray{configPath: configPath}
+	return &EmbeddedXray{
+		configPath:   configPath,
+		speedMonitor: NewSpeedMonitor(),
+	}
+}
+
+func (e *EmbeddedXray) GetSpeedMonitor() *SpeedMonitor {
+	return e.speedMonitor
 }
 
 func (e *EmbeddedXray) Start() error {
