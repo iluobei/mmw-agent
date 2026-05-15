@@ -19,12 +19,16 @@ import (
 	"sync"
 	"time"
 
+	"crypto/ed25519"
+	"encoding/base64"
+
 	"mmw-agent/internal/collector"
 	"mmw-agent/internal/config"
 	"mmw-agent/internal/constants"
 	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/limiter"
+	"mmw-agent/internal/securechan"
 	"mmw-agent/internal/xrayconf"
 	"mmw-agent/internal/xrayctl"
 
@@ -73,11 +77,18 @@ type Client struct {
 	// 许可证状态
 	licenseStatus *LicenseStatus
 	licenseMu     sync.RWMutex
+
+	// 加密通信
+	masterPubKey  ed25519.PublicKey
+	wsSession     *securechan.Session
+	wsSessionMu   sync.Mutex
+	httpSession   *securechan.Session
+	httpSessionMu sync.Mutex
 }
 
 // 创建 agent 客户端。
 func NewClient(cfg *config.Config) *Client {
-	return &Client{
+	c := &Client{
 		config:      cfg,
 		collector:   collector.NewCollector(),
 		xrayServers: cfg.XrayServers,
@@ -86,8 +97,17 @@ func NewClient(cfg *config.Config) *Client {
 		httpClient: &http.Client{
 			Timeout: constants.DefaultHTTPClientTimeout,
 		},
-		currentMode: ModePull, // 默认使用拉取模式
+		currentMode: ModePull,
 	}
+	if cfg.MasterPublicKey != "" {
+		if pub, err := securechan.ParsePublicKey(cfg.MasterPublicKey); err == nil {
+			c.masterPubKey = pub
+			log.Printf("[Agent] Master public key loaded, encrypted communication enabled")
+		} else {
+			log.Printf("[Agent] Warning: invalid master_public_key: %v", err)
+		}
+	}
+	return c
 }
 
 // 生成 WebSocket 握手请求头。
@@ -300,8 +320,23 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 		c.wsConn = nil
 		c.connected = false
 		c.wsMu.Unlock()
+		c.wsSessionMu.Lock()
+		c.wsSession = nil
+		c.wsSessionMu.Unlock()
 		conn.Close()
 	}()
+
+	// 密钥交换（如果配置了 master 公钥）
+	if c.masterPubKey != nil {
+		session, err := c.performKeyExchange(conn)
+		if err != nil {
+			return fmt.Errorf("key exchange failed: %w", err)
+		}
+		c.wsSessionMu.Lock()
+		c.wsSession = session
+		c.wsSessionMu.Unlock()
+		log.Printf("[Agent] Encrypted session established")
+	}
 
 	if err := c.authenticate(conn); err != nil {
 		return err
@@ -336,7 +371,7 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 		"payload": json.RawMessage(authPayload),
 	}
 
-	if err := conn.WriteJSON(msg); err != nil {
+	if err := c.writeEncrypted(conn, msg); err != nil {
 		return err
 	}
 
@@ -345,6 +380,7 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	if err != nil {
 		return err
 	}
+	message = c.decryptMessage(message)
 
 	var result struct {
 		Type    string `json:"type"`
@@ -363,6 +399,109 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	}
 
 	return nil
+}
+
+// 执行 WS 密钥交换。
+func (c *Client) performKeyExchange(conn *websocket.Conn) (*securechan.Session, error) {
+	agentPriv, agentPub, err := securechan.GenerateEphemeral()
+	if err != nil {
+		return nil, err
+	}
+
+	kxPayload, _ := json.Marshal(map[string]string{
+		"agent_ephemeral_pub": base64.StdEncoding.EncodeToString(agentPub),
+	})
+	msg := map[string]interface{}{
+		"type":    "key_exchange",
+		"payload": json.RawMessage(kxPayload),
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		return nil, err
+	}
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, message, err := conn.ReadMessage()
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Type    string `json:"type"`
+		Payload struct {
+			MasterEphemeralPub string `json:"master_ephemeral_pub"`
+			Signature          string `json:"signature"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(message, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Type != "key_exchange_resp" {
+		return nil, fmt.Errorf("unexpected response type: %s", resp.Type)
+	}
+
+	masterEphPub, err := base64.StdEncoding.DecodeString(resp.Payload.MasterEphemeralPub)
+	if err != nil || len(masterEphPub) != 32 {
+		return nil, fmt.Errorf("invalid master ephemeral key")
+	}
+
+	sig, err := base64.StdEncoding.DecodeString(resp.Payload.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("invalid signature encoding")
+	}
+	if !securechan.Verify(c.masterPubKey, masterEphPub, sig) {
+		return nil, fmt.Errorf("master signature verification failed")
+	}
+
+	sharedSecret, err := securechan.ComputeSharedSecret(agentPriv, masterEphPub)
+	if err != nil {
+		return nil, err
+	}
+
+	return securechan.DeriveSession(sharedSecret, agentPub, masterEphPub, false)
+}
+
+// 加密写入 WS 消息。
+func (c *Client) writeEncrypted(conn *websocket.Conn, msg interface{}) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	c.wsSessionMu.Lock()
+	session := c.wsSession
+	c.wsSessionMu.Unlock()
+
+	if session != nil {
+		envelope, err := session.Encrypt(data)
+		if err != nil {
+			return err
+		}
+		c.wsMu.Lock()
+		err = conn.WriteMessage(websocket.BinaryMessage, envelope)
+		c.wsMu.Unlock()
+		return err
+	}
+
+	c.wsMu.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, data)
+	c.wsMu.Unlock()
+	return err
+}
+
+// 解密读取 WS 消息。
+func (c *Client) decryptMessage(message []byte) []byte {
+	c.wsSessionMu.Lock()
+	session := c.wsSession
+	c.wsSessionMu.Unlock()
+
+	if session != nil && len(message) > 0 && message[0] == securechan.EnvelopeVersion {
+		if plaintext, err := session.Decrypt(message); err == nil {
+			return plaintext
+		} else {
+			log.Printf("[Agent] Decrypt error: %v", err)
+		}
+	}
+	return message
 }
 
 // 处理流量、速率和心跳上报。
@@ -384,7 +523,7 @@ func (c *Client) runMessageLoop(ctx context.Context, conn *websocket.Conn) error
 				errCh <- err
 				return
 			}
-			// 投递到消息处理通道
+			message = c.decryptMessage(message)
 			select {
 			case msgCh <- message:
 			default:
@@ -449,11 +588,7 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 		"payload": json.RawMessage(payload),
 	}
 
-	c.wsMu.Lock()
-	err = conn.WriteJSON(msg)
-	c.wsMu.Unlock()
-
-	if err != nil {
+	if err := c.writeEncrypted(conn, msg); err != nil {
 		return err
 	}
 
@@ -477,11 +612,7 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 		"payload": json.RawMessage(payload),
 	}
 
-	c.wsMu.Lock()
-	err := conn.WriteJSON(msg)
-	c.wsMu.Unlock()
-
-	return err
+	return c.writeEncrypted(conn, msg)
 }
 
 // SetEmbeddedXray 设置嵌入模式的 Xray 实例。
@@ -743,20 +874,8 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 	}
 	u.Path = constants.PathRemoteTraffic
 
-	req, err := c.newRequest(ctx, http.MethodPost, u.String(), payload)
-	if err != nil {
+	if _, err := c.doEncryptedHTTP(ctx, u.String(), payload); err != nil {
 		return err
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	log.Printf("[Agent] Sent traffic data via HTTP: %d inbounds, %d outbounds, %d users",
@@ -779,20 +898,8 @@ func (c *Client) sendSpeedHTTP(ctx context.Context) error {
 	}
 	u.Path = constants.PathRemoteSpeed
 
-	req, err := c.newRequest(ctx, http.MethodPost, u.String(), payload)
-	if err != nil {
+	if _, err := c.doEncryptedHTTP(ctx, u.String(), payload); err != nil {
 		return err
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	log.Printf("[Agent] Sent speed via HTTP: ↑%d B/s ↓%d B/s", uploadSpeed, downloadSpeed)
@@ -814,32 +921,140 @@ func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 	}
 	u.Path = constants.PathRemoteHeartbeat
 
-	req, err := c.newRequest(ctx, http.MethodPost, u.String(), payload)
+	respBody, err := c.doEncryptedHTTP(ctx, u.String(), payload)
 	if err != nil {
 		return err
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var hbResp struct {
 		ServerTime int64 `json:"server_time"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&hbResp); err == nil && hbResp.ServerTime > 0 {
+	if err := json.Unmarshal(respBody, &hbResp); err == nil && hbResp.ServerTime > 0 {
 		if drift := time.Now().Unix() - hbResp.ServerTime; drift > 10 || drift < -10 {
 			log.Printf("[Agent] Clock drift detected: local time is %+ds from master", drift)
 		}
 	}
 
 	return nil
+}
+
+// 通过 HTTP 发送加密请求，自动处理密钥交换和会话管理。
+func (c *Client) doEncryptedHTTP(ctx context.Context, urlStr string, payload []byte) ([]byte, error) {
+	if c.masterPubKey == nil {
+		req, err := c.newRequest(ctx, http.MethodPost, urlStr, payload)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		}
+		return body, nil
+	}
+
+	c.httpSessionMu.Lock()
+	session := c.httpSession
+	c.httpSessionMu.Unlock()
+
+	if session == nil {
+		return c.doHTTPKeyExchange(ctx, urlStr, payload)
+	}
+
+	encrypted, err := session.Encrypt(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encrypt: %w", err)
+	}
+
+	req, err := c.newRequest(ctx, http.MethodPost, urlStr, encrypted)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Encrypted", "1")
+	req.Header.Set(constants.HeaderContentType, "application/octet-stream")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusPreconditionFailed {
+		c.httpSessionMu.Lock()
+		c.httpSession = nil
+		c.httpSessionMu.Unlock()
+		log.Printf("[Agent] HTTP session expired, re-negotiating")
+		return c.doHTTPKeyExchange(ctx, urlStr, payload)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	if resp.Header.Get("X-Encrypted") == "1" {
+		decrypted, err := session.Decrypt(body)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt response: %w", err)
+		}
+		return decrypted, nil
+	}
+	return body, nil
+}
+
+// 执行 HTTP 密钥交换并发送请求。
+func (c *Client) doHTTPKeyExchange(ctx context.Context, urlStr string, payload []byte) ([]byte, error) {
+	agentPriv, agentPub, err := securechan.GenerateEphemeral()
+	if err != nil {
+		return nil, fmt.Errorf("generate ephemeral key: %w", err)
+	}
+
+	req, err := c.newRequest(ctx, http.MethodPost, urlStr, payload)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Key-Exchange", base64.StdEncoding.EncodeToString(agentPub))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	if kxResp := resp.Header.Get("X-Key-Exchange"); kxResp != "" {
+		parts := strings.SplitN(kxResp, "|", 2)
+		if len(parts) == 2 {
+			masterEphPub, err1 := base64.StdEncoding.DecodeString(parts[0])
+			sig, err2 := base64.StdEncoding.DecodeString(parts[1])
+			if err1 == nil && err2 == nil && len(masterEphPub) == 32 {
+				if securechan.Verify(c.masterPubKey, masterEphPub, sig) {
+					sharedSecret, err := securechan.ComputeSharedSecret(agentPriv, masterEphPub)
+					if err == nil {
+						newSession, err := securechan.DeriveSession(sharedSecret, agentPub, masterEphPub, false)
+						if err == nil {
+							c.httpSessionMu.Lock()
+							c.httpSession = newSession
+							c.httpSessionMu.Unlock()
+							log.Printf("[Agent] HTTP key exchange completed")
+						}
+					}
+				} else {
+					log.Printf("[Agent] HTTP key exchange: master signature verification failed")
+				}
+			}
+		}
+	}
+
+	return body, nil
 }
 
 // 在拉取模式下持续上报流量，保持在线状态。
@@ -916,11 +1131,7 @@ func (c *Client) sendSpeedData(conn *websocket.Conn) error {
 		"payload": json.RawMessage(payload),
 	}
 
-	c.wsMu.Lock()
-	err := conn.WriteJSON(msg)
-	c.wsMu.Unlock()
-
-	if err != nil {
+	if err := c.writeEncrypted(conn, msg); err != nil {
 		return err
 	}
 
@@ -1399,16 +1610,8 @@ func (c *Client) handleDomainLatencyProbe(conn *websocket.Conn, payload WSDomain
 		"type":    WSMsgTypeDomainLatencyResult,
 		"payload": json.RawMessage(respBytes),
 	}
-	msgBytes, err := json.Marshal(msg)
-	if err != nil {
-		log.Printf("[Agent] Failed to marshal WS message: %v", err)
-		return
-	}
 
-	c.wsMu.Lock()
-	err = conn.WriteMessage(websocket.TextMessage, msgBytes)
-	c.wsMu.Unlock()
-	if err != nil {
+	if err := c.writeEncrypted(conn, msg); err != nil {
 		log.Printf("[Agent] Failed to send domain_latency_result: %v", err)
 		return
 	}
@@ -1529,11 +1732,7 @@ func (c *Client) sendScanResult(conn *websocket.Conn) {
 		"payload": json.RawMessage(payload),
 	}
 
-	c.wsMu.Lock()
-	err := conn.WriteJSON(msg)
-	c.wsMu.Unlock()
-
-	if err != nil {
+	if err := c.writeEncrypted(conn, msg); err != nil {
 		log.Printf("[Agent] Failed to send scan_result: %v", err)
 		return
 	}

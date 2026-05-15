@@ -30,6 +30,7 @@ const (
 	PathChildValidateSite      = "/api/child/validate-site"
 	PathChildLimiter           = "/api/child/limiter"
 	PathChildSwitchXrayMode    = "/api/child/agent/switch-xray-mode"
+	PathChildUpdateMasterURL   = "/api/child/agent/update-master-url"
 )
 
 const (

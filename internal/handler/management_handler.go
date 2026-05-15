@@ -25,6 +25,7 @@ import (
 	"mmw-agent/internal/xrpc"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
+	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/infra/conf"
 )
 
@@ -32,11 +33,14 @@ var nginxInstalling atomic.Bool
 
 // ManageHandler 处理子端管理接口请求。
 type ManageHandler struct {
-	configToken    string
-	configPath     string
-	restartMethod  string
-	restartCommand string
-	embeddedXray   *embedded.EmbeddedXray
+	configToken          string
+	configPath           string
+	restartMethod        string
+	restartCommand       string
+	xrayMode             string
+	embeddedXray         *embedded.EmbeddedXray
+	embeddedMu           sync.Mutex
+	onEmbeddedXrayStart  func(*embedded.EmbeddedXray)
 }
 
 // 创建管理处理器。
@@ -53,17 +57,76 @@ func (h *ManageHandler) SetConfigPath(path string) {
 	h.configPath = path
 }
 
+// SetXrayMode 设置 Xray 运行模式（embedded/external）。
+func (h *ManageHandler) SetXrayMode(mode string) {
+	h.xrayMode = mode
+}
+
+// OnEmbeddedXrayStart 注册 embedded xray 延迟启动后的回调。
+func (h *ManageHandler) OnEmbeddedXrayStart(fn func(*embedded.EmbeddedXray)) {
+	h.onEmbeddedXrayStart = fn
+}
+
 // SetEmbeddedXray 设置嵌入模式的 Xray 实例。
 func (h *ManageHandler) SetEmbeddedXray(ex *embedded.EmbeddedXray) {
 	h.embeddedXray = ex
 }
 
+// GetEmbeddedXray 返回当前嵌入 Xray 实例。
+func (h *ManageHandler) GetEmbeddedXray() *embedded.EmbeddedXray {
+	return h.embeddedXray
+}
+
 // RestartXray 使用配置的重启方式重启 xray。
 func (h *ManageHandler) RestartXray() error {
-	if h.embeddedXray != nil {
-		return h.embeddedXray.Restart()
+	if h.xrayMode == "embedded" {
+		h.embeddedMu.Lock()
+		defer h.embeddedMu.Unlock()
+		if h.embeddedXray != nil {
+			return h.embeddedXray.Restart()
+		}
+		return h.lazyStartEmbeddedXray()
 	}
 	return xrayctl.RestartXray(h.restartMethod, h.restartCommand)
+}
+
+// lazyStartEmbeddedXray 在 embedded 模式下延迟初始化 xray 实例。
+func (h *ManageHandler) lazyStartEmbeddedXray() error {
+	for _, p := range constants.DefaultXrayConfigPaths {
+		if _, err := os.Stat(p); err == nil {
+			log.Printf("[Manage] Lazy-starting embedded Xray with config: %s", p)
+			_ = exec.Command("systemctl", "stop", "xray").Run()
+			_ = exec.Command("systemctl", "disable", "xray").Run()
+
+			// 先停 nginx 释放端口（tunnel 模式 xray 需要监听 443）
+			stoppedNginx := false
+			if out, err := exec.Command("systemctl", "is-active", "nginx").Output(); err == nil && strings.TrimSpace(string(out)) == "active" {
+				log.Printf("[Manage] Stopping nginx before embedded xray start")
+				_ = exec.Command("systemctl", "stop", "nginx").Run()
+				stoppedNginx = true
+			}
+
+			ex := embedded.New(p)
+			if err := ex.Start(); err != nil {
+				log.Printf("[Manage] Embedded xray start failed: %v", err)
+				if stoppedNginx {
+					_ = exec.Command("systemctl", "start", "nginx").Run()
+				}
+				return fmt.Errorf("start embedded xray: %w", err)
+			}
+			h.embeddedXray = ex
+			if h.onEmbeddedXrayStart != nil {
+				h.onEmbeddedXrayStart(ex)
+			}
+
+			if stoppedNginx {
+				log.Printf("[Manage] Restarting nginx after embedded xray start")
+				_ = exec.Command("systemctl", "start", "nginx").Run()
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("no xray config found for embedded mode")
 }
 
 // 校验请求身份（token + User-Agent）。
@@ -146,6 +209,18 @@ func (h *ManageHandler) HandleServicesStatus(w http.ResponseWriter, r *http.Requ
 
 func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 	status := &ServiceStatus{}
+
+	if h.xrayMode == "embedded" {
+		status.Installed = true
+		vs := core.VersionStatement()
+		if len(vs) > 0 {
+			status.Version = vs[0]
+		}
+		h.embeddedMu.Lock()
+		status.Running = h.embeddedXray != nil
+		h.embeddedMu.Unlock()
+		return status
+	}
 
 	xrayPath, err := exec.LookPath("xray")
 	if err != nil {
@@ -337,7 +412,7 @@ func (h *ManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Request
 	log.Printf("[Manage] Xray installed successfully")
 
 	// 若无配置则下发默认配置
-	h.deployDefaultXrayConfig()
+	h.DeployDefaultXrayConfig()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
@@ -1535,14 +1610,19 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 		action = "add"
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if h.xrayMode == "embedded" && h.embeddedXray != nil {
+		h.manageInboundEmbedded(w, ctx, action, &req)
+		return
+	}
+
 	apiPort := h.findXrayAPIPort()
 	if apiPort == 0 {
 		writeError(w, http.StatusInternalServerError, "Xray API not available")
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
 	clients, err := xrpc.New(ctx, constants.LocalhostIP, uint16(apiPort))
 	if err != nil {
@@ -1601,7 +1681,7 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 		if configErr != nil {
 			// 配置文件操作失败
 			if runtimeErr != nil {
-				// 两边都失败时，判断是否只是“未找到”错误
+				// 两边都失败时，判断是否只是"未找到"错误
 				if strings.Contains(runtimeErr.Error(), "not enough information") {
 					// Xray 返回运行态不存在该入站，这属于可接受情况
 					// 仅返回配置文件错误
@@ -1616,6 +1696,89 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 配置成功时，运行态报错可接受（可能尚未加载）
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Inbound removed successfully",
+		})
+
+	default:
+		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add' or 'remove'")
+	}
+}
+
+func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context.Context, action string, req *InboundRequest) {
+	switch action {
+	case "add":
+		if req.Inbound == nil {
+			writeError(w, http.StatusBadRequest, "Inbound payload is required")
+			return
+		}
+
+		inboundJSON, err := json.Marshal(req.Inbound)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to marshal inbound: %v", err))
+			return
+		}
+		inboundConfig := &conf.InboundDetourConfig{}
+		if err := json.Unmarshal(inboundJSON, inboundConfig); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to parse inbound config: %v", err))
+			return
+		}
+		rawConfig, err := inboundConfig.Build()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to build inbound config: %v", err))
+			return
+		}
+
+		if tag, ok := req.Inbound["tag"].(string); ok && tag != "" {
+			_ = h.embeddedXray.RemoveInbound(tag)
+		}
+
+		if err := h.embeddedXray.AddInbound(rawConfig); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to add inbound: %v", err))
+			return
+		}
+
+		if err := h.persistInbound(req.Inbound); err != nil {
+			log.Printf("[Manage] Error: Failed to persist inbound to config: %v", err)
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "Inbound added to runtime, but failed to persist to config: " + err.Error(),
+				"warning": "persist_failed",
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Inbound added successfully",
+		})
+
+	case "remove":
+		if req.Tag == "" {
+			writeError(w, http.StatusBadRequest, "Tag is required for remove action")
+			return
+		}
+
+		runtimeErr := h.embeddedXray.RemoveInbound(req.Tag)
+		if runtimeErr != nil {
+			log.Printf("[Manage] Warning: Failed to remove inbound from runtime: %v", runtimeErr)
+		}
+
+		configErr := h.removeInboundFromConfig(req.Tag)
+		if configErr != nil {
+			log.Printf("[Manage] Warning: Failed to remove inbound from config: %v", configErr)
+		}
+
+		if configErr != nil {
+			if runtimeErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound: runtime=%v, config=%v", runtimeErr, configErr))
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to remove inbound from config: %v", configErr))
+			}
+			return
+		}
+
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"success": true,
 			"message": "Inbound removed successfully",
@@ -2809,8 +2972,25 @@ func (h *ManageHandler) HandleClearStreamPort(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// 在缺失配置时下发内置默认配置。
-func (h *ManageHandler) deployDefaultXrayConfig() {
+// DeployDefaultXrayConfigFile 仅写入内置默认配置文件，不启动 xray。
+func (h *ManageHandler) DeployDefaultXrayConfigFile() {
+	configPath := constants.DefaultXrayConfigPaths[0]
+	if _, err := os.Stat(configPath); err == nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+		log.Printf("[Manage] Failed to create xray config dir: %v", err)
+		return
+	}
+	if err := os.WriteFile(configPath, defaultXrayConfig, 0644); err != nil {
+		log.Printf("[Manage] Failed to write default xray config: %v", err)
+		return
+	}
+	log.Printf("[Manage] Deployed default xray config to %s", configPath)
+}
+
+// DeployDefaultXrayConfig 在缺失配置时写入内置默认配置并启动 xray。
+func (h *ManageHandler) DeployDefaultXrayConfig() {
 	configPath := constants.DefaultXrayConfigPaths[0]
 	if _, err := os.Stat(configPath); err == nil {
 		// 配置已存在，执行 EnsureXrayConfig 补齐缺失段
@@ -2925,7 +3105,7 @@ func (h *ManageHandler) HandleXrayInstallStream(w http.ResponseWriter, r *http.R
 	sseStreamCmd(w, r, cmd, "Xray installed successfully")
 
 	// 安装完成后下发默认配置
-	h.deployDefaultXrayConfig()
+	h.DeployDefaultXrayConfig()
 }
 
 func (h *ManageHandler) HandleXrayRemoveStream(w http.ResponseWriter, r *http.Request) {
@@ -3182,6 +3362,72 @@ func (h *ManageHandler) HandleSwitchXrayMode(w http.ResponseWriter, r *http.Requ
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		log.Printf("[Manage] Restarting agent for xray_mode switch to %s", req.XrayMode)
+		exec.Command("systemctl", "restart", "mmw-agent").Start()
+	}()
+}
+
+// HandleUpdateMasterURL 处理 POST /api/child/agent/update-master-url。
+// 更新 config.yaml 中的 master_url 并重启 agent。
+func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	var req struct {
+		MasterURL string `json:"master_url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MasterURL == "" {
+		writeError(w, http.StatusBadRequest, "master_url required")
+		return
+	}
+
+	if h.configPath == "" {
+		writeError(w, http.StatusInternalServerError, "Config path not set")
+		return
+	}
+
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Read config: %v", err))
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "master_url:") {
+			lines[i] = "master_url: " + req.MasterURL
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, "master_url: "+req.MasterURL)
+	}
+
+	if err := os.WriteFile(h.configPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Write config: %v", err))
+		return
+	}
+	log.Printf("[Manage] Config updated: master_url=%s", req.MasterURL)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("master_url updated to %s, agent restarting...", req.MasterURL),
+	})
+
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		log.Printf("[Manage] Restarting agent for master_url update")
 		exec.Command("systemctl", "restart", "mmw-agent").Start()
 	}()
 }

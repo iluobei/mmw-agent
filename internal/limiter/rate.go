@@ -21,7 +21,17 @@ func NewRateWriter(writer buf.Writer, limiter *rate.Limiter) buf.Writer {
 }
 
 func (w *RateWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	w.limiter.WaitN(context.Background(), int(mb.Len()))
+	ctx := context.Background()
+	n := int(mb.Len())
+	burst := w.limiter.Burst()
+	for n > 0 {
+		take := n
+		if take > burst {
+			take = burst
+		}
+		_ = w.limiter.WaitN(ctx, take)
+		n -= take
+	}
 	return w.writer.WriteMultiBuffer(mb)
 }
 

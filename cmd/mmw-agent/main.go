@@ -16,6 +16,7 @@ import (
 	"mmw-agent/internal/constants"
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/handler"
+	"mmw-agent/internal/securechan"
 )
 
 func main() {
@@ -64,6 +65,7 @@ func main() {
 	// 创建处理器
 	manageHandler := handler.NewManageHandler(cfg.Token, cfg.RestartMethod, cfg.RestartCommand)
 	manageHandler.SetConfigPath(cfgFile)
+	manageHandler.SetXrayMode(cfg.XrayMode)
 
 	// 嵌入模式：启动内嵌 Xray 实例
 	var embeddedXray *embedded.EmbeddedXray
@@ -75,12 +77,19 @@ func main() {
 			_ = exec.Command("systemctl", "stop", "xray").Run()
 			_ = exec.Command("systemctl", "disable", "xray").Run()
 
+			if _, err := os.Stat(configPath); os.IsNotExist(err) {
+				log.Printf("[Main] Embedded mode: config not found, deploying built-in default config")
+				manageHandler.DeployDefaultXrayConfigFile()
+			}
+
 			log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
 			embeddedXray = embedded.New(configPath)
 			if err := embeddedXray.Start(); err != nil {
-				log.Fatalf("[Main] Failed to start embedded Xray: %v", err)
+				log.Printf("[Main] Warning: embedded Xray failed to start (will retry via lazy-start): %v", err)
+				embeddedXray = nil
+			} else {
+				manageHandler.SetEmbeddedXray(embeddedXray)
 			}
-			manageHandler.SetEmbeddedXray(embeddedXray)
 		} else {
 			log.Printf("[Main] Embedded mode requires xray config path, falling back to external")
 		}
@@ -109,6 +118,9 @@ func main() {
 	if embeddedXray != nil {
 		agentClient.SetEmbeddedXray(embeddedXray)
 	}
+	manageHandler.OnEmbeddedXrayStart(func(ex *embedded.EmbeddedXray) {
+		agentClient.SetEmbeddedXray(ex)
+	})
 
 	// 创建 API 处理器
 	apiHandler := handler.NewAPIHandler(agentClient, cfg.Token)
@@ -124,10 +136,21 @@ func main() {
 		w.Write([]byte(`{"status":"ok","mode":"` + string(agentClient.GetCurrentMode()) + `"}`))
 	})
 
+	// 解析 Master 公钥用于 Pull 模式加密
+	var pullHandler http.Handler = mux
+	if cfg.MasterPublicKey != "" {
+		if pubKey, err := securechan.ParsePublicKey(cfg.MasterPublicKey); err == nil {
+			pullHandler = handler.CryptoMiddleware(pubKey, mux)
+			log.Printf("[Main] Pull mode encryption enabled")
+		} else {
+			log.Printf("[Main] Warning: invalid master_public_key for pull crypto: %v", err)
+		}
+	}
+
 	// 创建 HTTP 服务（不设置 WriteTimeout，避免影响 SSE 长连接）
 	server := &http.Server{
 		Addr:        ":" + cfg.ListenPort,
-		Handler:     handler.SilentAuthMiddleware(cfg.Token, mux),
+		Handler:     handler.SilentAuthMiddleware(cfg.Token, pullHandler),
 		ReadTimeout: constants.DefaultReadTimeout,
 	}
 

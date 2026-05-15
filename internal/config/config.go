@@ -25,6 +25,7 @@ type Config struct {
 	SpeedReportInterval   time.Duration `yaml:"speed_report_interval"`
 	RestartMethod         string        `yaml:"restart_method"`
 	RestartCommand        string        `yaml:"restart_command"`
+	MasterPublicKey       string        `yaml:"master_public_key"`
 }
 
 // XrayServer 表示本机 Xray 节点配置。
@@ -61,8 +62,9 @@ func fromEnvRaw() *Config {
 		ConnectionMode: os.Getenv("MMWX_CONNECTION_MODE"),
 		ListenPort:     os.Getenv("MMWX_LISTEN_PORT"),
 		XrayMode:       os.Getenv("MMWX_XRAY_MODE"),
-		RestartMethod:  os.Getenv("MMWX_RESTART_METHOD"),
-		RestartCommand: os.Getenv("MMWX_RESTART_COMMAND"),
+		RestartMethod:   os.Getenv("MMWX_RESTART_METHOD"),
+		RestartCommand:  os.Getenv("MMWX_RESTART_COMMAND"),
+		MasterPublicKey: os.Getenv("MMWX_MASTER_PUBLIC_KEY"),
 	}
 
 	if xrayConfig := os.Getenv("MMWX_XRAY_CONFIG"); xrayConfig != "" {
@@ -130,6 +132,9 @@ func (c *Config) Merge(env *Config) {
 	}
 	if env.RestartCommand != "" {
 		c.RestartCommand = env.RestartCommand
+	}
+	if env.MasterPublicKey != "" {
+		c.MasterPublicKey = env.MasterPublicKey
 	}
 }
 

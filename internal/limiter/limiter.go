@@ -56,7 +56,7 @@ func (l *Limiter) UpdateInboundLimiter(tag string, users []UserInfo) {
 			if bucket, ok := info.BucketHub.Load(key); ok {
 				limiter := bucket.(*rate.Limiter)
 				limiter.SetLimit(rate.Limit(limit))
-				limiter.SetBurst(int(limit))
+				limiter.SetBurst(calcBurst(limit))
 			}
 		} else {
 			info.BucketHub.Delete(key)
@@ -125,7 +125,7 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 	// Speed limit
 	limit := determineRate(nodeLimit, userLimit)
 	if limit > 0 {
-		newLimiter := rate.NewLimiter(rate.Limit(limit), int(limit))
+		newLimiter := rate.NewLimiter(rate.Limit(limit), calcBurst(limit))
 		if v, loaded := info.BucketHub.LoadOrStore(email, newLimiter); loaded {
 			return v.(*rate.Limiter), true, false
 		}
@@ -187,13 +187,24 @@ func (l *Limiter) SetUserSpeed(tag, email string, speedLimit uint64) {
 		if v, ok := info.BucketHub.Load(email); ok {
 			limiter := v.(*rate.Limiter)
 			limiter.SetLimit(rate.Limit(speedLimit))
-			limiter.SetBurst(int(speedLimit))
+			limiter.SetBurst(calcBurst(speedLimit))
 		} else {
-			info.BucketHub.Store(email, rate.NewLimiter(rate.Limit(speedLimit), int(speedLimit)))
+			info.BucketHub.Store(email, rate.NewLimiter(rate.Limit(speedLimit), calcBurst(speedLimit)))
 		}
 	} else {
 		info.BucketHub.Delete(email)
 	}
+}
+
+func calcBurst(bytesPerSec uint64) int {
+	b := bytesPerSec / 4 // 250ms worth
+	if b < 64<<10 {
+		return 64 << 10 // min 64KB
+	}
+	if b > 256<<10 {
+		return 256 << 10 // max 256KB
+	}
+	return int(b)
 }
 
 // determineRate returns the minimum non-zero rate between node and user limits.
