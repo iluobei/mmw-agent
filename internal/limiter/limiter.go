@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/xtls/xray-core/common/buf"
@@ -132,7 +133,13 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		return newLimiter, true, false
 	}
 
-	return nil, false, false
+	// No static limit — create an unlimited bucket so auto speed limit can
+	// dynamically throttle existing connections via SetUserSpeed.
+	unlimited := rate.NewLimiter(rate.Limit(math.MaxFloat64), math.MaxInt)
+	if v, loaded := info.BucketHub.LoadOrStore(email, unlimited); loaded {
+		return v.(*rate.Limiter), true, false
+	}
+	return unlimited, true, false
 }
 
 func (l *Limiter) RateWriter(writer buf.Writer, limiter *rate.Limiter) buf.Writer {
@@ -177,6 +184,7 @@ func (l *Limiter) GetOnlineUsers(tag string) map[string][]string {
 }
 
 // SetUserSpeed temporarily overrides a user's speed limit bucket.
+// When speedLimit=0, restores the user's original rate (static limit or unlimited).
 func (l *Limiter) SetUserSpeed(tag, email string, speedLimit uint64) {
 	value, ok := l.InboundInfo.Load(tag)
 	if !ok {
@@ -185,15 +193,42 @@ func (l *Limiter) SetUserSpeed(tag, email string, speedLimit uint64) {
 	info := value.(*InboundInfo)
 	if speedLimit > 0 {
 		if v, ok := info.BucketHub.Load(email); ok {
-			limiter := v.(*rate.Limiter)
-			limiter.SetLimit(rate.Limit(speedLimit))
-			limiter.SetBurst(calcBurst(speedLimit))
+			lim := v.(*rate.Limiter)
+			lim.SetLimit(rate.Limit(speedLimit))
+			lim.SetBurst(calcBurst(speedLimit))
 		} else {
 			info.BucketHub.Store(email, rate.NewLimiter(rate.Limit(speedLimit), calcBurst(speedLimit)))
 		}
 	} else {
-		info.BucketHub.Delete(email)
+		// Restore to original rate — modify the existing bucket in place
+		// so existing connections (holding a reference) are also restored.
+		origLimit := l.getUserStaticLimit(info, tag, email)
+		if v, ok := info.BucketHub.Load(email); ok {
+			lim := v.(*rate.Limiter)
+			if origLimit > 0 {
+				lim.SetLimit(rate.Limit(origLimit))
+				lim.SetBurst(calcBurst(origLimit))
+			} else {
+				lim.SetLimit(rate.Limit(math.MaxFloat64))
+				lim.SetBurst(math.MaxInt)
+			}
+		}
 	}
+}
+
+func (l *Limiter) getUserStaticLimit(info *InboundInfo, tag, email string) uint64 {
+	var userLimit uint64
+	expectedPrefix := fmt.Sprintf("%s|%s|", tag, email)
+	info.UserInfo.Range(func(k, v interface{}) bool {
+		key := k.(string)
+		if len(key) >= len(expectedPrefix) && key[:len(expectedPrefix)] == expectedPrefix {
+			u := v.(UserInfo)
+			userLimit = u.SpeedLimit
+			return false
+		}
+		return true
+	})
+	return determineRate(info.NodeSpeedLimit, userLimit)
 }
 
 func calcBurst(bytesPerSec uint64) int {

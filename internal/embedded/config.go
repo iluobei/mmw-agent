@@ -10,6 +10,7 @@ import (
 	confserial "github.com/xtls/xray-core/infra/conf/serial"
 
 	officialdispatcher "github.com/xtls/xray-core/app/dispatcher"
+	"github.com/xtls/xray-core/app/metrics"
 	"github.com/xtls/xray-core/app/policy"
 
 	mydispatcher "mmw-agent/internal/dispatcher"
@@ -55,6 +56,7 @@ func buildCoreConfig(configPath string) (*core.Config, error) {
 		serial.GetMessageType(&officialstats.Config{}):      true,
 		serial.GetMessageType(&policy.Config{}):              true,
 		serial.GetMessageType(&mydispatcher.Config{}):        true,
+		serial.GetMessageType(&metrics.Config{}):             true,
 	}
 	for _, app := range pbConfig.App {
 		if !skipTypes[app.Type] {

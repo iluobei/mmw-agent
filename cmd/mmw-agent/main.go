@@ -121,6 +121,12 @@ func main() {
 	manageHandler.OnEmbeddedXrayStart(func(ex *embedded.EmbeddedXray) {
 		agentClient.SetEmbeddedXray(ex)
 	})
+	// lazyStartEmbeddedXray 可能在回调注册前已经执行（EnsureXrayConfig 触发），补偿传递
+	if ex := manageHandler.GetEmbeddedXray(); ex != nil && embeddedXray == nil {
+		log.Printf("[Main] Propagating lazy-started embedded Xray to agent client")
+		agentClient.SetEmbeddedXray(ex)
+		embeddedXray = ex
+	}
 
 	// 创建 API 处理器
 	apiHandler := handler.NewAPIHandler(agentClient, cfg.Token)

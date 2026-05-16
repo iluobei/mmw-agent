@@ -83,11 +83,57 @@ func (h *ManageHandler) RestartXray() error {
 		h.embeddedMu.Lock()
 		defer h.embeddedMu.Unlock()
 		if h.embeddedXray != nil {
-			return h.embeddedXray.Restart()
+			return h.restartEmbeddedXray()
 		}
 		return h.lazyStartEmbeddedXray()
 	}
 	return xrayctl.RestartXray(h.restartMethod, h.restartCommand)
+}
+
+// restartEmbeddedXray 重启已有的 embedded xray，处理 tunnel 模式端口冲突。
+func (h *ManageHandler) restartEmbeddedXray() error {
+	stoppedNginx := false
+	if h.configNeedsPort443() {
+		if out, err := exec.Command("systemctl", "is-active", "nginx").Output(); err == nil && strings.TrimSpace(string(out)) == "active" {
+			log.Printf("[Manage] Stopping nginx before embedded xray restart (tunnel mode)")
+			_ = exec.Command("systemctl", "stop", "nginx").Run()
+			stoppedNginx = true
+		}
+	}
+
+	err := h.embeddedXray.Restart()
+
+	if stoppedNginx {
+		log.Printf("[Manage] Restarting nginx after embedded xray restart")
+		_ = exec.Command("systemctl", "start", "nginx").Run()
+	}
+
+	return err
+}
+
+// configNeedsPort443 检查当前 xray 配置是否有 inbound 监听 443 端口。
+func (h *ManageHandler) configNeedsPort443() bool {
+	for _, p := range constants.DefaultXrayConfigPaths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var config struct {
+			Inbounds []struct {
+				Port json.Number `json:"port"`
+			} `json:"inbounds"`
+		}
+		if json.Unmarshal(data, &config) != nil {
+			continue
+		}
+		for _, ib := range config.Inbounds {
+			if port, _ := ib.Port.Int64(); port == 443 {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // lazyStartEmbeddedXray 在 embedded 模式下延迟初始化 xray 实例。
@@ -217,7 +263,7 @@ func (h *ManageHandler) getXrayStatus() *ServiceStatus {
 			status.Version = vs[0]
 		}
 		h.embeddedMu.Lock()
-		status.Running = h.embeddedXray != nil
+		status.Running = h.embeddedXray != nil && h.embeddedXray.IsRunning()
 		h.embeddedMu.Unlock()
 		return status
 	}
@@ -3250,14 +3296,15 @@ func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		InboundTag string `json:"inbound_tag"`
-		NodeLimit  uint64 `json:"node_limit"`
-		Users      []struct {
+		InboundTag     string `json:"inbound_tag"`
+		NodeLimit      uint64 `json:"node_limit"`
+		Users          []struct {
 			UID         int    `json:"uid"`
 			Email       string `json:"email"`
 			SpeedLimit  uint64 `json:"speed_limit"`
 			DeviceLimit int    `json:"device_limit"`
 		} `json:"users"`
+		AutoSpeedRules []embedded.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -3281,6 +3328,14 @@ func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	l.AddInboundLimiter(req.InboundTag, req.NodeLimit, users)
+
+	if len(req.AutoSpeedRules) > 0 {
+		if monitor := h.embeddedXray.GetSpeedMonitor(); monitor != nil {
+			monitor.UpdateRules(req.AutoSpeedRules)
+			monitor.SetLimiter(l)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
 

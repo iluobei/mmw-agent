@@ -2,8 +2,10 @@ package embedded
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/app/proxyman/command"
 	"github.com/xtls/xray-core/common/protocol"
@@ -42,7 +44,7 @@ func (e *EmbeddedXray) Start() error {
 		return err
 	}
 
-	instance, err := core.New(pbConfig)
+	instance, err := e.safeNewInstance(pbConfig)
 	if err != nil {
 		return err
 	}
@@ -66,6 +68,16 @@ func (e *EmbeddedXray) Start() error {
 	return nil
 }
 
+func (e *EmbeddedXray) safeNewInstance(pbConfig *core.Config) (inst *core.Instance, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("xray core.New panicked: %v", r)
+		}
+	}()
+	inst, err = core.New(pbConfig)
+	return
+}
+
 func (e *EmbeddedXray) Stop() error {
 	e.mu.Lock()
 	instance := e.instance
@@ -85,7 +97,27 @@ func (e *EmbeddedXray) Restart() error {
 	if err := e.Stop(); err != nil {
 		log.Printf("[EmbeddedXray] Stop error: %v", err)
 	}
-	return e.Start()
+	// Wait for OS to release listener ports (metrics, gRPC API)
+	time.Sleep(500 * time.Millisecond)
+
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		lastErr = e.Start()
+		if lastErr == nil {
+			return nil
+		}
+		log.Printf("[EmbeddedXray] Start attempt %d failed: %v", attempt, lastErr)
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+	return lastErr
+}
+
+func (e *EmbeddedXray) IsRunning() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.instance != nil
 }
 
 func (e *EmbeddedXray) GetLimiter() *limiter.Limiter {

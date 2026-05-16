@@ -634,6 +634,7 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 // SetEmbeddedXray 设置嵌入模式的 Xray 实例。
 func (c *Client) SetEmbeddedXray(ex *embedded.EmbeddedXray) {
 	c.embeddedXray = ex
+	log.Printf("[Agent] Embedded Xray reference updated (non-nil=%v)", ex != nil)
 }
 
 // GetEmbeddedXray 返回嵌入模式的 Xray 实例。
