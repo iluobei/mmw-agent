@@ -91,6 +91,9 @@ type Client struct {
 	wsSessionMu   sync.Mutex
 	httpSession   *securechan.Session
 	httpSessionMu sync.Mutex
+
+	// 公网 IPv4 缓存
+	publicIPv4 string
 }
 
 // 创建 agent 客户端。
@@ -625,11 +628,15 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 
 // 发送心跳消息。
 func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
+	if c.publicIPv4 == "" {
+		c.publicIPv4 = c.detectPublicIPv4()
+	}
 	listenPort, _ := strconv.Atoi(c.config.ListenPort)
 	payload, _ := json.Marshal(map[string]interface{}{
 		"boot_time":   c.startTime,
 		"listen_port": listenPort,
 		"local_time":  time.Now().Unix(),
+		"public_ipv4": c.publicIPv4,
 	})
 
 	msg := map[string]interface{}{
@@ -638,6 +645,44 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 	}
 
 	return c.writeEncrypted(conn, msg)
+}
+
+func (c *Client) detectPublicIPv4() string {
+	urls := []string{"https://4.ipw.cn", "https://api4.ipify.org"}
+	client := &http.Client{Timeout: 5 * time.Second}
+	for _, u := range urls {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		if ip != "" && !strings.Contains(ip, ":") {
+			return ip
+		}
+	}
+	// fallback: try to get any public IP (may be IPv6)
+	fallbackURLs := []string{"https://ipw.cn", "https://api64.ipify.org"}
+	for _, u := range fallbackURLs {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		if ip != "" {
+			return ip
+		}
+	}
+	return ""
 }
 
 // SetEmbeddedXray 设置嵌入模式的 Xray 实例。
