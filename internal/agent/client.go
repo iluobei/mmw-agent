@@ -74,6 +74,10 @@ type Client struct {
 	// 流量采集时间（用于计算用户网速）
 	lastTrafficTime time.Time
 
+	// 限速评估（基于快照，不重置计数器）
+	lastLimitEvalTime    time.Time
+	lastUserTrafficSnap  map[string]int64
+
 	// 嵌入模式
 	embeddedXray *embedded.EmbeddedXray
 
@@ -556,6 +560,7 @@ func (c *Client) runMessageLoop(ctx context.Context, conn *websocket.Conn) error
 			if err := c.sendSpeedData(conn); err != nil {
 				return err
 			}
+			c.evaluateSpeedLimits()
 		case <-heartbeatTicker.C:
 			if err := c.sendHeartbeat(conn); err != nil {
 				return err
@@ -572,6 +577,10 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 		log.Printf("[Agent] Failed to collect metrics: %v", err)
 		stats = &collector.XrayStats{}
 	}
+
+	// collectLocalMetrics 使用 Set(0) 重置了计数器，需要同步重置快照基线
+	c.lastUserTrafficSnap = nil
+	c.lastLimitEvalTime = now
 
 	payloadMap := map[string]interface{}{
 		"stats": stats,
@@ -860,6 +869,7 @@ func (c *Client) runHTTPReporterLoop(ctx context.Context) {
 			if err := c.sendSpeedHTTP(ctx); err != nil {
 				log.Printf("[Agent] Failed to send speed via HTTP: %v", err)
 			}
+			c.evaluateSpeedLimits()
 		case <-heartbeatTicker.C:
 			if err := c.sendHeartbeatHTTP(ctx); err != nil {
 				consecutiveErrors++
@@ -880,6 +890,10 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 	if err != nil {
 		stats = &collector.XrayStats{}
 	}
+
+	now := time.Now()
+	c.lastUserTrafficSnap = nil
+	c.lastLimitEvalTime = now
 
 	payload, _ := json.Marshal(map[string]interface{}{
 		"stats": stats,
@@ -1185,6 +1199,50 @@ func (c *Client) collectSpeed() (uploadSpeed, downloadSpeed int64) {
 	c.lastSampleTime = now
 
 	return uploadSpeed, downloadSpeed
+}
+
+// 基于流量快照评估自动限速规则（每个 speed tick 调用）。
+func (c *Client) evaluateSpeedLimits() {
+	if c.embeddedXray == nil {
+		return
+	}
+	monitor := c.embeddedXray.GetSpeedMonitor()
+	if monitor == nil {
+		return
+	}
+
+	now := time.Now()
+	snapshot := c.embeddedXray.SnapshotUserTraffic()
+	if snapshot == nil {
+		return
+	}
+
+	if c.lastLimitEvalTime.IsZero() || c.lastUserTrafficSnap == nil {
+		c.lastLimitEvalTime = now
+		c.lastUserTrafficSnap = snapshot
+		return
+	}
+
+	elapsed := now.Sub(c.lastLimitEvalTime)
+	if elapsed <= 0 {
+		return
+	}
+
+	userDeltas := make(map[string]int64, len(snapshot))
+	for email, total := range snapshot {
+		prev := c.lastUserTrafficSnap[email]
+		delta := total - prev
+		if delta > 0 {
+			userDeltas[email] = delta
+		}
+	}
+
+	c.lastLimitEvalTime = now
+	c.lastUserTrafficSnap = snapshot
+
+	if len(userDeltas) > 0 {
+		monitor.Evaluate(userDeltas, elapsed)
+	}
 }
 
 // 从 /proc/net/dev 读取网卡统计。

@@ -52,6 +52,39 @@ func (e *EmbeddedXray) CollectStats() *collector.XrayStats {
 	return result
 }
 
+// SnapshotUserTraffic returns per-user cumulative traffic using Value() (non-destructive).
+func (e *EmbeddedXray) SnapshotUserTraffic() map[string]int64 {
+	e.mu.RLock()
+	sm := e.statsManager
+	e.mu.RUnlock()
+	if sm == nil {
+		return nil
+	}
+
+	type counterLister interface {
+		VisitCounters(func(string, stats.Counter) bool)
+	}
+	lister, ok := sm.(counterLister)
+	if !ok {
+		return nil
+	}
+
+	result := make(map[string]int64)
+	lister.VisitCounters(func(name string, c stats.Counter) bool {
+		if !strings.HasPrefix(name, "user>>>") {
+			return true
+		}
+		parts := strings.Split(name, ">>>")
+		if len(parts) != 4 || parts[2] != "traffic" {
+			return true
+		}
+		email := parts[1]
+		result[email] += c.Value()
+		return true
+	})
+	return result
+}
+
 func collectCounterPair(sm stats.Manager, dest map[string]collector.TrafficData, category string) {
 	// We need to scan all registered counters. Unfortunately stats.Manager
 	// doesn't have a ListCounters method. We'll use a different approach:
