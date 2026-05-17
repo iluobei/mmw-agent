@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -69,29 +70,34 @@ func main() {
 
 	// 嵌入模式：启动内嵌 Xray 实例
 	var embeddedXray *embedded.EmbeddedXray
-	if cfg.XrayMode == "embedded" && len(cfg.XrayServers) > 0 {
-		configPath := cfg.XrayServers[0].ConfigPath
-		if configPath != "" {
-			// 停止外部 Xray 避免端口冲突
-			log.Printf("[Main] Stopping external xray service before embedded start...")
-			_ = exec.Command("systemctl", "stop", "xray").Run()
-			_ = exec.Command("systemctl", "disable", "xray").Run()
+	if cfg.XrayMode == "embedded" {
+		configPath := ""
+		if len(cfg.XrayServers) > 0 {
+			configPath = cfg.XrayServers[0].ConfigPath
+		}
+		if configPath == "" {
+			configPath = constants.DefaultXrayConfigPaths[0]
+			log.Printf("[Main] Embedded mode: no xray server discovered, using default config path: %s", configPath)
+		}
 
-			if _, err := os.Stat(configPath); os.IsNotExist(err) {
-				log.Printf("[Main] Embedded mode: config not found, deploying built-in default config")
-				manageHandler.DeployDefaultXrayConfigFile()
-			}
+		// 停止外部 Xray 避免端口冲突
+		log.Printf("[Main] Stopping external xray service before embedded start...")
+		_ = exec.Command("systemctl", "stop", "xray").Run()
+		_ = exec.Command("systemctl", "disable", "xray").Run()
 
-			log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
-			embeddedXray = embedded.New(configPath)
-			if err := embeddedXray.Start(); err != nil {
-				log.Printf("[Main] Warning: embedded Xray failed to start (will retry via lazy-start): %v", err)
-				embeddedXray = nil
-			} else {
-				manageHandler.SetEmbeddedXray(embeddedXray)
-			}
+		if _, err := os.Stat(configPath); os.IsNotExist(err) {
+			log.Printf("[Main] Embedded mode: config not found, creating minimal config")
+			_ = os.MkdirAll(filepath.Dir(configPath), 0755)
+			_ = os.WriteFile(configPath, []byte("{}"), 0644)
+		}
+
+		log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
+		embeddedXray = embedded.New(configPath)
+		if err := embeddedXray.Start(); err != nil {
+			log.Printf("[Main] Warning: embedded Xray failed to start (will retry via lazy-start): %v", err)
+			embeddedXray = nil
 		} else {
-			log.Printf("[Main] Embedded mode requires xray config path, falling back to external")
+			manageHandler.SetEmbeddedXray(embeddedXray)
 		}
 	}
 
