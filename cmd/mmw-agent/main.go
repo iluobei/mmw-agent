@@ -85,10 +85,14 @@ func main() {
 		_ = exec.Command("systemctl", "stop", "xray").Run()
 		_ = exec.Command("systemctl", "disable", "xray").Run()
 
-		if _, err := os.Stat(configPath); os.IsNotExist(err) {
-			log.Printf("[Main] Embedded mode: config not found, creating minimal config")
+		if needsDefaultConfig(configPath) {
+			log.Printf("[Main] Embedded mode: config missing or empty, creating default template config")
 			_ = os.MkdirAll(filepath.Dir(configPath), 0755)
-			_ = os.WriteFile(configPath, []byte("{}"), 0644)
+			_ = os.WriteFile(configPath, []byte(embedded.DefaultConfigJSON), 0644)
+		}
+		// 补全配置（api、stats、policy、routing等），与外置模式一致
+		if result := manageHandler.EnsureXrayConfig(); result.Modified {
+			log.Printf("[Main] Embedded mode: config auto-completed, added: %v", result.AddedSections)
 		}
 
 		log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
@@ -205,4 +209,16 @@ func main() {
 	}
 
 	log.Printf("[Main] Shutdown complete")
+}
+
+func needsDefaultConfig(path string) bool {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil {
+		return true
+	}
+	// 文件存在但内容为空或只有 "{}" (<=4 bytes 包含换行)
+	return info.Size() <= 4
 }
