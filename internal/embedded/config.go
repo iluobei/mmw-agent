@@ -27,13 +27,12 @@ func buildCoreConfig(configPath string) (*core.Config, error) {
 		return nil, err
 	}
 
-	// Prepend our custom dispatcher config BEFORE the official one.
-	// This ensures RequireFeatures resolves our custom dispatcher first.
+	// 只注册自定义 dispatcher,不再注册 officialdispatcher。
+	// 自定义 dispatcher.Type() 返回 routing.DispatcherType(),会被作为标准 routing.Dispatcher feature 解析,
+	// 所有走 routing.Dispatcher 的流量进入自定义实现 → limiter / per-user RateWriter / user-traffic stats 才能挂得上。
+	// 若同时注册官方 dispatcher,xray-core 内部会以官方实现为准,limiter 钩子完全无效。
 	customApps := []*serial.TypedMessage{
 		serial.ToTypedMessage(&mydispatcher.Config{}),
-		serial.ToTypedMessage(&officialdispatcher.Config{
-			Settings: &officialdispatcher.SessionConfig{},
-		}),
 		serial.ToTypedMessage(&officialstats.Config{}),
 		serial.ToTypedMessage(&policy.Config{
 			Level: map[uint32]*policy.Policy{

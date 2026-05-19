@@ -1630,8 +1630,14 @@ func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
 		}
 	}
 
-	log.Printf("[Agent] Updated limiter for inbound %s: %d users, node_limit=%d",
-		payload.InboundTag, len(users), payload.NodeLimit)
+	// 日志包含每个用户的限速值,便于线上排查"为什么限速不生效"——
+	// 常见原因 1: master 端 SpeedLimitMbps 是 0; 常见原因 2: vision/splice 协议会绕开 RateWriter。
+	var userSpeeds []string
+	for _, u := range users {
+		userSpeeds = append(userSpeeds, fmt.Sprintf("%s=%dB/s", u.Email, u.SpeedLimit))
+	}
+	log.Printf("[Agent] Updated limiter for inbound %s: %d users, node_limit=%d, per-user=[%s]",
+		payload.InboundTag, len(users), payload.NodeLimit, strings.Join(userSpeeds, ","))
 }
 
 // 采集所有 inbound 的在线设备信息。
