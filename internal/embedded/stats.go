@@ -10,7 +10,14 @@ import (
 
 // CollectStats reads traffic counters from the embedded stats.Manager
 // and returns them in the same format as the HTTP metrics collector.
-// Counters are reset after reading (Set(0)).
+//
+// Counters are read NON-destructively (Value(), not Set(0)) so the values
+// are cumulative since the xray process started. The master assumes
+// cumulative semantics in UpsertNodeTraffic / UpsertUserTraffic — if we
+// reset after each read here, every report looks like a "restart" to
+// master (current < last), forcing it down the restart-accumulation path.
+// That path happens to add up to the right total, but only after a one-tick
+// lag and a flood of "Detected Xray restart" log lines.
 func (e *EmbeddedXray) CollectStats() *collector.XrayStats {
 	e.mu.RLock()
 	sm := e.statsManager
@@ -86,16 +93,11 @@ func (e *EmbeddedXray) SnapshotUserTraffic() map[string]int64 {
 }
 
 func collectCounterPair(sm stats.Manager, dest map[string]collector.TrafficData, category string) {
-	// We need to scan all registered counters. Unfortunately stats.Manager
-	// doesn't have a ListCounters method. We'll use a different approach:
-	// iterate through the known counter interface.
-	// For now, we rely on the concrete stats implementation.
 	type counterLister interface {
 		VisitCounters(func(string, stats.Counter) bool)
 	}
 	if lister, ok := sm.(counterLister); ok {
 		lister.VisitCounters(func(name string, c stats.Counter) bool {
-			// Parse "category>>>name>>>traffic>>>direction"
 			if !strings.HasPrefix(name, category+">>>") {
 				return true
 			}
@@ -105,14 +107,14 @@ func collectCounterPair(sm stats.Manager, dest map[string]collector.TrafficData,
 			}
 			tag := parts[1]
 			direction := parts[3]
-			value := c.Set(0) // read and reset
+			value := c.Value() // cumulative; resets only when xray process restarts
 
 			td := dest[tag]
 			switch direction {
 			case "uplink":
-				td.Uplink += value
+				td.Uplink = value
 			case "downlink":
-				td.Downlink += value
+				td.Downlink = value
 			}
 			dest[tag] = td
 			return true
