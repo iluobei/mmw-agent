@@ -2,6 +2,9 @@ name: Build and Release
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   build:
@@ -87,7 +90,8 @@ jobs:
         with:
           draft: false
           prerelease: false
-          generate_release_notes: true
+          # release.sh 已用自定义 changelog 创建 Release，这里只上传二进制，不覆盖说明
+          generate_release_notes: false
           files: |
             release/mmw-agent-linux-amd64
             release/mmw-agent-linux-arm64
