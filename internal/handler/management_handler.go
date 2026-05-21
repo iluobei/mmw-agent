@@ -416,6 +416,39 @@ type ServiceControlRequest struct {
 	Action  string `json:"action"`
 }
 
+// serviceFailureDetail 在 nginx/xray 启停失败时抓取真实失败原因:
+// 先用配置测试(nginx -t / xray -test)给出具体错误(证书缺失、端口占用、配置语法等),
+// 再附加 journalctl 最近日志兜底。systemctl 自身只会给"see journalctl"这类笼统提示,这里把真实原因带回主控。
+func serviceFailureDetail(service string) string {
+	var parts []string
+	switch service {
+	case "nginx":
+		for _, bin := range constants.NginxBinarySearchPaths {
+			if p, err := exec.LookPath(bin); err == nil {
+				if out, _ := exec.Command(p, "-t").CombinedOutput(); len(strings.TrimSpace(string(out))) > 0 {
+					parts = append(parts, "nginx -t: "+strings.TrimSpace(string(out)))
+				}
+				break
+			}
+		}
+	case "xray":
+		if p, err := exec.LookPath("xray"); err == nil {
+			for _, cfg := range constants.DefaultXrayConfigPaths {
+				if _, e := os.Stat(cfg); e == nil {
+					if out, _ := exec.Command(p, "run", "-test", "-config", cfg).CombinedOutput(); len(strings.TrimSpace(string(out))) > 0 {
+						parts = append(parts, "xray 配置检查: "+strings.TrimSpace(string(out)))
+					}
+					break
+				}
+			}
+		}
+	}
+	if out, _ := exec.Command("journalctl", "-u", service, "-n", "12", "--no-pager", "-o", "cat").CombinedOutput(); len(strings.TrimSpace(string(out))) > 0 {
+		parts = append(parts, "日志: "+strings.TrimSpace(string(out)))
+	}
+	return strings.Join(parts, " | ")
+}
+
 // 处理 POST /api/child/services/control。
 func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -446,7 +479,7 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 
 	if req.Service == "xray" && req.Action == "restart" {
 		if err := h.RestartXray(); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to restart xray: %v", err))
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("重启 xray 失败: %v %s", err, serviceFailureDetail("xray")))
 			return
 		}
 	} else if req.Service == "xray" && req.Action == "stop" {
@@ -485,14 +518,14 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 				h.deployFallback443()
 				h.reloadNginx()
 			}
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to start xray: %v", err))
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("启动 xray 失败: %v %s", err, serviceFailureDetail("xray")))
 			return
 		}
 	} else {
 		cmd := exec.Command("systemctl", req.Action, req.Service)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to %s %s: %v - %s", req.Action, req.Service, err, string(output)))
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s %s 失败: %v %s | %s", req.Action, req.Service, err, strings.TrimSpace(string(output)), serviceFailureDetail(req.Service)))
 			return
 		}
 	}
