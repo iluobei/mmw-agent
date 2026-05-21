@@ -5,6 +5,9 @@
 <details>
 <summary>更新日志</summary>
 
+### v0.0.9 (2026-05-21)
+- 🛠️ fix:vision limiter fork
+
 ### v0.0.8 (2026-05-21)
 - 🌈 增加缺少的错误信息提示
 
