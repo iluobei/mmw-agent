@@ -18,6 +18,7 @@ import (
 	"mmw-agent/internal/agent"
 	"mmw-agent/internal/config"
 	"mmw-agent/internal/constants"
+	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/handler"
 	"mmw-agent/internal/securechan"
@@ -74,13 +75,34 @@ func main() {
 	// 嵌入模式：启动内嵌 Xray 实例
 	var embeddedXray *embedded.EmbeddedXray
 	if cfg.XrayMode == "embedded" {
-		configPath := ""
-		if len(cfg.XrayServers) > 0 {
-			configPath = cfg.XrayServers[0].ConfigPath
-		}
-		if configPath == "" {
-			configPath = constants.DefaultXrayConfigPaths[0]
-			log.Printf("[Main] Embedded mode: no xray server discovered, using default config path: %s", configPath)
+		// embedded 模式统一使用 mmwx 标准路径(constants.DefaultXrayConfigPaths[0],
+		// 通常是 /usr/local/etc/xray/config.json),不管以前外置 xray 装在哪。
+		// 这样跨服务器路径一致,mmwx UI / API 永远操作同一个文件。
+		//
+		// 注:config.applyDefaults 启动时会 auto-discover 把发现的路径填进 cfg.XrayServers,
+		// embedded 模式下要忽略它(那是外置 xray 的路径,不是 mmwx 接管后的目标)。
+		configPath := constants.DefaultXrayConfigPaths[0]
+
+		// 探测当前外置 xray 在跑哪个 config 路径 + confdir,合并迁移到 mmwx 标准路径。
+		discovered := discovery.Discover()
+		if discovered.ConfigPath != "" && discovered.ConfigPath != configPath {
+			merged, backup, err := handler.MergeXrayConfdirInto(discovered, configPath)
+			if err != nil {
+				log.Printf("[Main] WARN: merge external xray config failed: %v", err)
+			} else {
+				log.Printf("[Main] Embedded mode: imported external xray config from %s (+%d confdir files) into %s; confdir backup: %s",
+					discovered.ConfigPath, merged, configPath, backup)
+				// 把原外置 config 归档(防止外置 xray 被误启动后又抢端口/与 mmwx 配置漂移)
+				_ = os.Rename(discovered.ConfigPath, discovered.ConfigPath+".before-mmwx-"+time.Now().Format("20060102-150405"))
+			}
+		} else if discovered.ConfigPath == configPath && discovered.ConfDir != "" {
+			// 路径相同但有 confdir 多片,原地合并
+			merged, backup, err := handler.MergeXrayConfdirInto(discovered, configPath)
+			if err != nil {
+				log.Printf("[Main] WARN: merge confdir failed: %v", err)
+			} else if merged > 0 {
+				log.Printf("[Main] Embedded mode: merged %d confdir files into %s (backup: %s)", merged, configPath, backup)
+			}
 		}
 
 		// 停止外部 Xray 避免端口冲突

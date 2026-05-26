@@ -32,6 +32,7 @@ const (
 	PathChildSwitchXrayMode    = "/api/child/agent/switch-xray-mode"
 	PathChildSwitchListenPort  = "/api/child/agent/switch-listen-port"
 	PathChildUpdateMasterURL   = "/api/child/agent/update-master-url"
+	PathChildTakeoverXray      = "/api/child/external-xray/takeover"
 )
 
 const (
