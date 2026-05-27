@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -295,17 +296,35 @@ func initXrayConfig(path string, stealMode string) {
 
 	switch stealMode {
 	case "tunnel", "fallback":
-		// 偷自己模式：备份原配置后用模板覆盖
-		if _, err := os.Stat(path); err == nil {
-			_ = os.Rename(path, path+".backup")
-			log.Printf("[Main] Backed up existing config to %s.backup", path)
-		}
+		// 偷自己模式:把模板需要的入站(tunnel-in / api)、出站(direct/block/nginx)、routing 规则
+		// 合并到现有配置里 — 模板有的覆盖,模板没有的(用户自建 inbound/outbound/规则)保留。
+		// 历史上此处是直接覆盖,导致重启 agent 后用户在主控里建的所有 inbound/出站链/路由规则全部丢失。
 		tpl := embedded.TunnelConfigJSON
 		if stealMode == "fallback" {
 			tpl = embedded.DefaultConfigJSON
 		}
-		_ = os.WriteFile(path, []byte(tpl), 0644)
-		log.Printf("[Main] Steal-self mode (%s): wrote template config", stealMode)
+		existing, err := os.ReadFile(path)
+		if err != nil || len(existing) <= 4 {
+			// 没有现有配置 / 现有配置为空,直接写模板
+			_ = os.WriteFile(path, []byte(tpl), 0644)
+			log.Printf("[Main] Steal-self mode (%s): no existing config, wrote template", stealMode)
+			return
+		}
+		merged, err := mergeXrayConfig(existing, []byte(tpl))
+		if err != nil {
+			// 合并失败(JSON 解析异常),退化到原"备份+覆盖"行为
+			_ = os.Rename(path, path+".backup")
+			log.Printf("[Main] Steal-self mode (%s): merge failed (%v), backed up to %s.backup and wrote template", stealMode, err, path)
+			_ = os.WriteFile(path, []byte(tpl), 0644)
+			return
+		}
+		// 写之前留一份备份,出问题用户能回滚
+		_ = os.WriteFile(path+".backup", existing, 0644)
+		if err := os.WriteFile(path, merged, 0644); err != nil {
+			log.Printf("[Main] Steal-self mode (%s): write merged config failed: %v", stealMode, err)
+			return
+		}
+		log.Printf("[Main] Steal-self mode (%s): merged template into existing config (backup: %s.backup)", stealMode, path)
 	default:
 		// 普通模式：配置不存在或为空时写入默认模板
 		info, err := os.Stat(path)
@@ -314,4 +333,123 @@ func initXrayConfig(path string, stealMode string) {
 			log.Printf("[Main] Config missing or empty, wrote default template config")
 		}
 	}
+}
+
+// mergeXrayConfig 把 template 合并进 existing,返回合并后 JSON。
+// 合并语义:
+//   - inbounds / outbounds: 数组按 tag 合并 — 同 tag 用 template 的,template 没有的 tag 保留 existing 的
+//   - routing.rules: 数组按 marktag 合并(template 在前) — 同 marktag 用 template 的,
+//     template 没有 marktag 的 existing 规则追加在后(顺序保持,因为 xray 路由按顺序匹配)
+//   - 其他顶层字段(log/dns/api/stats/policy/metrics 等): template 提供则覆盖,否则保留 existing
+func mergeXrayConfig(existing, template []byte) ([]byte, error) {
+	var existMap, tplMap map[string]any
+	if err := json.Unmarshal(existing, &existMap); err != nil {
+		return nil, fmt.Errorf("parse existing config: %w", err)
+	}
+	if err := json.Unmarshal(template, &tplMap); err != nil {
+		return nil, fmt.Errorf("parse template config: %w", err)
+	}
+
+	result := make(map[string]any, len(existMap)+len(tplMap))
+	for k, v := range existMap {
+		result[k] = v
+	}
+
+	for k, v := range tplMap {
+		switch k {
+		case "inbounds":
+			result["inbounds"] = mergeTaggedArray(existMap["inbounds"], v)
+		case "outbounds":
+			result["outbounds"] = mergeTaggedArray(existMap["outbounds"], v)
+		case "routing":
+			result["routing"] = mergeRouting(existMap["routing"], v)
+		default:
+			result[k] = v
+		}
+	}
+
+	return json.MarshalIndent(result, "", "    ")
+}
+
+// mergeTaggedArray 合并两个对象数组,按 tag 字段为主键。template 中存在的 tag 覆盖 existing,
+// existing 独有的 tag 保留。返回值: template 列表 + existing 中 tag 不在 template 的项。
+func mergeTaggedArray(existingRaw, templateRaw any) []any {
+	existing, _ := existingRaw.([]any)
+	template, _ := templateRaw.([]any)
+
+	tplTags := make(map[string]bool)
+	for _, item := range template {
+		if obj, ok := item.(map[string]any); ok {
+			if tag, _ := obj["tag"].(string); tag != "" {
+				tplTags[tag] = true
+			}
+		}
+	}
+
+	merged := make([]any, 0, len(template)+len(existing))
+	merged = append(merged, template...)
+	for _, item := range existing {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			merged = append(merged, item)
+			continue
+		}
+		tag, _ := obj["tag"].(string)
+		if tag != "" && tplTags[tag] {
+			continue // template 已提供同 tag 项,跳过
+		}
+		merged = append(merged, item)
+	}
+	return merged
+}
+
+// mergeRouting 合并 routing 块。顶层字段(domainStrategy 等)以 template 为准;
+// rules 数组按 marktag 合并 — 同 marktag 用 template 的,有/无 marktag 的 existing 规则追加在 template 后。
+func mergeRouting(existingRaw, templateRaw any) any {
+	existing, _ := existingRaw.(map[string]any)
+	template, _ := templateRaw.(map[string]any)
+	if template == nil {
+		return existing
+	}
+	if existing == nil {
+		return template
+	}
+
+	merged := make(map[string]any, len(existing)+len(template))
+	for k, v := range existing {
+		merged[k] = v
+	}
+	for k, v := range template {
+		if k != "rules" {
+			merged[k] = v
+		}
+	}
+
+	existingRules, _ := existing["rules"].([]any)
+	templateRules, _ := template["rules"].([]any)
+
+	tplMarktags := make(map[string]bool)
+	for _, r := range templateRules {
+		if obj, ok := r.(map[string]any); ok {
+			if m, _ := obj["marktag"].(string); m != "" {
+				tplMarktags[m] = true
+			}
+		}
+	}
+
+	rules := make([]any, 0, len(templateRules)+len(existingRules))
+	rules = append(rules, templateRules...)
+	for _, r := range existingRules {
+		obj, ok := r.(map[string]any)
+		if !ok {
+			rules = append(rules, r)
+			continue
+		}
+		if m, _ := obj["marktag"].(string); m != "" && tplMarktags[m] {
+			continue
+		}
+		rules = append(rules, r)
+	}
+	merged["rules"] = rules
+	return merged
 }
