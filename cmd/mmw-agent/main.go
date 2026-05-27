@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -209,6 +210,18 @@ func main() {
 	// (否则 ListenAndServe 失败但 WebSocket 出站还活,会造成 agent HTTP API 死、
 	//  主控误以为"在线"无法触达的死锁状态)
 	//
+	// 端口冲突自适应:agent 默认 23889,如果用户的 xray inbound 已经占了 23889
+	// (常见于从老 mmw / 已有 xray 服务器迁移过来的场景,embedded xray 内部 bind 该端口),
+	// 这里会自动找下一个空闲端口并写回 config.yaml,避免 restart 死循环。
+	if newPort, ok := resolveListenPortConflict(cfg.ListenPort); ok {
+		log.Printf("[Main] Agent port %s conflict (likely xray inbound); switching to %d and persisting", cfg.ListenPort, newPort)
+		cfg.ListenPort = fmt.Sprintf("%d", newPort)
+		server.Addr = ":" + cfg.ListenPort
+		if err := persistListenPort(cfgFile, cfg.ListenPort); err != nil {
+			log.Printf("[Main] Warn: failed to persist new listen_port to %s: %v (next restart will re-detect)", cfgFile, err)
+		}
+	}
+
 	// EADDRINUSE 重试:Restart=always + RestartSec=5 的快速循环里,
 	// 上一实例的 LISTEN socket 可能还没被内核完全回收;直接 fail 会触发又一轮重启循环。
 	// 这里轮询最多 ~12s,绝大多数情况下旧 FD 释放后能成功 bind。
@@ -328,6 +341,62 @@ func listenWithRetry(network, addr string, attempts int, delay time.Duration) (n
 		time.Sleep(delay)
 	}
 	return nil, lastErr
+}
+
+// resolveListenPortConflict 探测 cfg.ListenPort 是否能 bind。
+// 不能就从该端口往上扫,跳过所有 listening socket,找一个真正空闲的端口返回。
+// 返回 (newPort, true) 表示发生切换;(_, false) 表示原端口可用。
+// 用途:agent 默认 23889,如果用户 xray inbound / 其它进程已经占了同端口,
+// 自动避让到 23890+ 而不是死循环 retry。
+func resolveListenPortConflict(currentPort string) (int, bool) {
+	want, err := strconv.Atoi(strings.TrimSpace(currentPort))
+	if err != nil || want < 1024 || want > 65535 {
+		return 0, false
+	}
+	// 先快速试一下当前端口
+	if ln, err := net.Listen("tcp", fmt.Sprintf(":%d", want)); err == nil {
+		ln.Close()
+		return want, false
+	}
+	// 当前端口被占 → 从 want+1 往上找
+	for offset := 1; offset < 100; offset++ {
+		candidate := want + offset
+		if candidate > 65535 {
+			break
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", candidate))
+		if err != nil {
+			continue
+		}
+		ln.Close()
+		return candidate, true
+	}
+	return 0, false
+}
+
+// persistListenPort 把新的 listen_port 写回 yaml config 文件(原行替换 / 没有则追加)。
+// 跟 management_handler.HandleSwitchListenPort 的写法保持一致,避免再做 yaml 序列化引入未知字段顺序变动。
+func persistListenPort(cfgFile, newPort string) error {
+	if cfgFile == "" {
+		return fmt.Errorf("config file path empty")
+	}
+	data, err := os.ReadFile(cfgFile)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "listen_port:") {
+			lines[i] = fmt.Sprintf("listen_port: \"%s\"", newPort)
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, fmt.Sprintf("listen_port: \"%s\"", newPort))
+	}
+	return os.WriteFile(cfgFile, []byte(strings.Join(lines, "\n")), 0644)
 }
 
 // killOtherMmwAgentProcesses 扫 /proc,把 exe 指向 mmw-agent 但 PID 不等于自己的进程全部 SIGKILL。
