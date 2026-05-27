@@ -3662,7 +3662,32 @@ esac
 
 RELEASE_URL="https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
 echo "Downloading from $RELEASE_URL..."
-wget -q --show-progress -O /tmp/mmw-agent-new "$RELEASE_URL" 2>/dev/null || curl -fsSL -o /tmp/mmw-agent-new "$RELEASE_URL"
+# 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "未检测到 curl/wget,尝试自动安装 curl..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y curl
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y curl
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache curl
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm curl
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper -n install curl
+    else
+        echo "ERROR: 无法识别系统包管理器,请手动安装 curl 或 wget" >&2
+        exit 1
+    fi
+fi
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o /tmp/mmw-agent-new "$RELEASE_URL"
+else
+    wget -q --show-progress -O /tmp/mmw-agent-new "$RELEASE_URL"
+fi
 
 chmod +x /tmp/mmw-agent-new
 echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"

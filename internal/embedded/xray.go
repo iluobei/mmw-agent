@@ -40,7 +40,14 @@ func (e *EmbeddedXray) GetSpeedMonitor() *SpeedMonitor {
 	return e.speedMonitor
 }
 
-func (e *EmbeddedXray) Start() error {
+func (e *EmbeddedXray) Start() (retErr error) {
+	// xray-core 内部偶发 panic(端口冲突 / 配置异常等)。没有 recover 时整个 agent 进程被带崩,
+	// 主控看到 "connection reset by peer";加 recover 后返回 error,handler 正常回 500。
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("xray start panicked: %v", r)
+		}
+	}()
 	pbConfig, err := buildCoreConfig(e.configPath)
 	if err != nil {
 		return err
@@ -51,7 +58,7 @@ func (e *EmbeddedXray) Start() error {
 		return err
 	}
 
-	if err := instance.Start(); err != nil {
+	if err := e.safeInstanceStart(instance); err != nil {
 		instance.Close()
 		return err
 	}
@@ -99,7 +106,22 @@ func (e *EmbeddedXray) safeNewInstance(pbConfig *core.Config) (inst *core.Instan
 	return
 }
 
-func (e *EmbeddedXray) Stop() error {
+// safeInstanceStart 把 instance.Start 包在 recover 里 — xray-core 启动期 panic 不再带崩 agent 进程。
+func (e *EmbeddedXray) safeInstanceStart(inst *core.Instance) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("xray instance.Start panicked: %v", r)
+		}
+	}()
+	return inst.Start()
+}
+
+func (e *EmbeddedXray) Stop() (retErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("xray stop panicked: %v", r)
+		}
+	}()
 	e.mu.Lock()
 	instance := e.instance
 	e.instance = nil

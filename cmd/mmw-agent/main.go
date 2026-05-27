@@ -299,6 +299,9 @@ func downloadFile(dest, url string) error {
 // listenWithRetry 在 EADDRINUSE 时按指定间隔重试 bind,其它错误立即返回。
 // 解决场景:agent 被 systemd 快速重启时,上一实例的 LISTEN socket 偶尔还没被内核回收;
 // 直接 fatal 会触发又一轮 5s 间隔的重启,把秒级问题拖成分钟级。
+//
+// 兜底:若 attempts 一半之后仍 EADDRINUSE,说明不是"内核延迟回收"而是真的有别的进程在占。
+// 主动找系统里其它 mmw-agent 进程(老的、systemd 没追踪到的 zombie)并 SIGKILL,避免无限重启循环。
 func listenWithRetry(network, addr string, attempts int, delay time.Duration) (net.Listener, error) {
 	var lastErr error
 	for i := 0; i < attempts; i++ {
@@ -315,9 +318,55 @@ func listenWithRetry(network, addr string, attempts int, delay time.Duration) (n
 			return nil, err
 		}
 		log.Printf("[Main] HTTP bind attempt %d/%d failed on %s (will retry in %v): %v", i+1, attempts, addr, delay, err)
+		// 重试到一半还失败,杀掉别的 mmw-agent 进程(自己除外)
+		if i == attempts/2 {
+			if n := killOtherMmwAgentProcesses(); n > 0 {
+				log.Printf("[Main] Killed %d orphan mmw-agent process(es), retrying bind", n)
+			}
+		}
 		time.Sleep(delay)
 	}
 	return nil, lastErr
+}
+
+// killOtherMmwAgentProcesses 扫 /proc,把 exe 指向 mmw-agent 但 PID 不等于自己的进程全部 SIGKILL。
+// 处理"老 agent 没死透 / systemd 没追踪到的 zombie"导致新实例无法 bind 端口的情况。
+func killOtherMmwAgentProcesses() int {
+	self := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	killed := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid := 0
+		for _, c := range e.Name() {
+			if c < '0' || c > '9' {
+				pid = 0
+				break
+			}
+			pid = pid*10 + int(c-'0')
+		}
+		if pid == 0 || pid == self {
+			continue
+		}
+		exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		if err != nil {
+			continue
+		}
+		// exe 可能是 /usr/local/bin/mmw-agent 或 /tmp/mmw-agent 之类,后缀匹配 mmw-agent
+		if !strings.HasSuffix(exe, "/mmw-agent") && !strings.Contains(exe, "mmw-agent ") {
+			continue
+		}
+		if err := syscall.Kill(pid, syscall.SIGKILL); err == nil {
+			log.Printf("[Main] SIGKILL orphan mmw-agent pid=%d exe=%s", pid, exe)
+			killed++
+		}
+	}
+	return killed
 }
 
 func initXrayConfig(path string, stealMode string) {
