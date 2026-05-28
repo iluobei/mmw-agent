@@ -3763,8 +3763,13 @@ fi
 chmod +x /tmp/mmw-agent-new
 echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"
 
-# 替换二进制(systemd Restart=always 会在 agent 退出后拉起新版本)
-cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent
+# 替换二进制(systemd Restart=always 会在 agent 退出后拉起新版本)。
+# 直接 cp 到 /usr/local/bin/mmw-agent 会触发 "Text file busy",因为正在运行的 mmw-agent 进程占着该 inode。
+# 改成"先 cp 到旁路文件,再原子 mv 覆盖" — Linux rename(2) 不影响正在执行的进程映射的旧 inode,
+# 新 inode 接管该路径,旧 inode 直到进程退出才释放。
+cp /tmp/mmw-agent-new /usr/local/bin/mmw-agent.new
+chmod +x /usr/local/bin/mmw-agent.new
+mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent
 rm -f /tmp/mmw-agent-new
 echo "Binary replaced; agent will exit and systemd will restart with new version."
 `
