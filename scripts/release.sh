@@ -48,7 +48,7 @@ echo "$COMMITS"
 echo ""
 
 # 1. 计算新版本号
-echo "[1/5] 计算版本号..."
+echo "[1/6] 计算版本号..."
 CUR=${PREV_TAG#v}
 IFS='.' read -r MAJ MIN PAT <<< "$CUR"
 case "${1:-patch}" in
@@ -68,8 +68,31 @@ esac
 NEW_VERSION="${MAJ}.${MIN}.${PAT}"
 echo "  -> 新版本: v${NEW_VERSION}"
 
-# 2. 更新 README changelog
-echo "[2/5] 更新 README changelog..."
+# 2. 同步版本号到 internal/version/version.go
+# 主控通过 /api/child/system/info 拿这个常量比对 GitHub latest tag,不同步会导致 UI 显示老版本号 → 误判可升级
+echo "[2/6] 同步 version.go..."
+VERSION_FILE="$PROJECT_ROOT/internal/version/version.go"
+if [ ! -f "$VERSION_FILE" ]; then
+  echo "[ERROR] 未找到 ${VERSION_FILE}"
+  exit 1
+fi
+# 用 awk 替换 const Version = "..." 这一行,留下其它注释/格式不动
+TMP_VER=$(mktemp)
+awk -v ver="$NEW_VERSION" '
+  /^const Version = ".*"$/ { print "const Version = \"" ver "\""; next }
+  { print }
+' "$VERSION_FILE" > "$TMP_VER"
+# 校验:替换后必须能 grep 到新版本,不然版本号格式跟脚本预期不一致
+if ! grep -q "const Version = \"${NEW_VERSION}\"" "$TMP_VER"; then
+  echo "[ERROR] version.go 同步失败 — 未匹配到 'const Version = ...' 行,请检查格式"
+  rm -f "$TMP_VER"
+  exit 1
+fi
+mv "$TMP_VER" "$VERSION_FILE"
+echo "  -> version.go 已更新为 ${NEW_VERSION}"
+
+# 3. 更新 README changelog
+echo "[3/6] 更新 README changelog..."
 TODAY=$(date +%Y-%m-%d)
 
 TMPFILE=$(mktemp)
@@ -94,20 +117,20 @@ mv "$PROJECT_ROOT/README.md.tmp" "$PROJECT_ROOT/README.md"
 rm -f "$TMPFILE"
 echo "  -> README 已更新"
 
-# 3. commit + tag
-echo "[3/5] 创建 commit 和 tag..."
+# 4. commit + tag
+echo "[4/6] 创建 commit 和 tag..."
 git add -A
 git commit -m "v${NEW_VERSION}" --no-verify
 git tag "v${NEW_VERSION}"
 echo "  -> tag: v${NEW_VERSION}"
 
-# 4. push
-echo "[4/5] 推送到远程..."
+# 5. push
+echo "[5/6] 推送到远程..."
 git push origin main
 git push origin "v${NEW_VERSION}"
 
-# 5. 创建 GitHub Release（二进制由 GitHub Action 在 tag 推送后自动编译并上传）
-echo "[5/5] 创建 GitHub Release..."
+# 6. 创建 GitHub Release（二进制由 GitHub Action 在 tag 推送后自动编译并上传）
+echo "[6/6] 创建 GitHub Release..."
 RELEASE_BODY="## 更新日志
 
 ### v${NEW_VERSION} (${TODAY})
