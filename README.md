@@ -5,6 +5,9 @@
 <details>
 <summary>更新日志</summary>
 
+### v0.1.8 (2026-05-29)
+- 🛠️ fix:优先上报ipv4
+
 ### v0.1.7 (2026-05-29)
 - 🛠️ fix:OpenRC LXC 双开 mmw-agent
 
