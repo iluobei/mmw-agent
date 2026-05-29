@@ -698,7 +698,20 @@ func (h *ManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.WriteFile(configPath, []byte(req.Config), 0644); err != nil {
+	// 即便主控推过来的整段 config 本身带重复 tag(历史 bug 残留 / 老版本主控混入),
+	// 也要在写盘前去重 — xray 启动时同 tag 入站会失败。
+	rawConfig := []byte(req.Config)
+	if parsed := map[string]interface{}{}; json.Unmarshal(rawConfig, &parsed) == nil {
+		ibRem := dedupeTaggedArrayInPlace(parsed, "inbounds")
+		obRem := dedupeTaggedArrayInPlace(parsed, "outbounds")
+		if ibRem > 0 || obRem > 0 {
+			if deduped, err := json.MarshalIndent(parsed, "", "  "); err == nil {
+				rawConfig = deduped
+				log.Printf("[Manage] setXrayConfig: stripped %d duplicate inbound(s) and %d duplicate outbound(s) before write", ibRem, obRem)
+			}
+		}
+	}
+	if err := os.WriteFile(configPath, rawConfig, 0644); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to write config: %v", err))
 		return
 	}
@@ -1656,11 +1669,144 @@ func (h *ManageHandler) listInbounds(w http.ResponseWriter, r *http.Request) {
 // PromoteAllTagsOnStartup agent 启动时调用一次,把缺 tag 的 inbound/outbound 当场写回磁盘,
 // 不依赖 listInbounds / listOutbounds 被调用。list 端点里的兜底逻辑保留(防止配置在 agent 启动
 // 后被手动改回缺 tag 状态)。
+// 同时跑一遍重复 tag 清理 — 给历史残留(主控老代码 race + persistInbound 老 bug 共同造成的
+// 同 tag inbound 累加)兜底。
 func (h *ManageHandler) PromoteAllTagsOnStartup() {
 	h.promoteInboundTagsToConfig()
 	if cfg := h.findXrayConfigPath(); cfg != "" {
 		promoteOutboundTagsInFile(cfg)
 	}
+	h.dedupeXrayConfigTagsOnDisk()
+}
+
+// dedupeXrayConfigTagsOnDisk 是绝对兜底:把 xray config 主文件里的同 tag inbound/outbound
+// 去重后写回。无论是历史残留还是任何代码路径写入,只要 agent 重启就清干净一次。
+// 保留策略:**保留第一份**(早出现的通常是真实业务数据,后面的是 race 累加出来的副本)。
+//   tag 为空的条目原样保留(可能是 vless reality 模板的中间态;不该出现但不在此处擦除)。
+func (h *ManageHandler) dedupeXrayConfigTagsOnDisk() {
+	configPath := h.findXrayConfigPath()
+	if configPath == "" {
+		return
+	}
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		return
+	}
+	inboundsRemoved := dedupeTaggedArrayInPlace(config, "inbounds")
+	outboundsRemoved := dedupeTaggedArrayInPlace(config, "outbounds")
+	if inboundsRemoved == 0 && outboundsRemoved == 0 {
+		return
+	}
+	newContent, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		log.Printf("[Manage] dedupe xray tags: marshal failed: %v", err)
+		return
+	}
+	if err := os.WriteFile(configPath, newContent, 0644); err != nil {
+		log.Printf("[Manage] dedupe xray tags: write %s failed: %v", configPath, err)
+		return
+	}
+	log.Printf("[Manage] dedupe xray tags: removed %d duplicate inbound(s) and %d duplicate outbound(s) from %s",
+		inboundsRemoved, outboundsRemoved, configPath)
+}
+
+// dedupeTaggedArrayInPlace 在 config 里的 `key`(inbounds / outbounds)数组上去重,返回删了几条。
+//
+// 关键策略:**不丢用户**。同 tag 出现多份时:
+//   - inbounds:把每份的 settings.clients(VLESS/VMess/Trojan/Hysteria/Shadowsocks)
+//     或 settings.accounts(SOCKS/HTTP)合并去重(按 id/password/auth/user/email 主键),
+//     保留第一份的 streamSettings / sniffing / port 等非 client 字段。
+//     这样即使 race 产生了两份相同 tag 的 inbound,后写入的 client 不会被擦掉,套餐绑定用户不丢。
+//   - outbounds:没有 client 概念,保留第一份(后写的通常是 race 副本)。
+//   - 空 tag 项全部保留(模板中间态)。
+func dedupeTaggedArrayInPlace(config map[string]interface{}, key string) int {
+	arr, ok := config[key].([]interface{})
+	if !ok {
+		return 0
+	}
+	type slot struct {
+		idx  int  // 在 kept 里的位置
+		first map[string]interface{} // 第一份(我们就地往它里面合并 clients)
+	}
+	seen := map[string]*slot{}
+	kept := arr[:0:0]
+	removed := 0
+	for _, item := range arr {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			kept = append(kept, item)
+			continue
+		}
+		tag, _ := m["tag"].(string)
+		if tag == "" {
+			kept = append(kept, item)
+			continue
+		}
+		if existing, has := seen[tag]; has {
+			if key == "inbounds" {
+				mergeInboundClients(existing.first, m)
+			}
+			removed++
+			continue
+		}
+		seen[tag] = &slot{idx: len(kept), first: m}
+		kept = append(kept, item)
+	}
+	if removed > 0 {
+		config[key] = kept
+	}
+	return removed
+}
+
+// mergeInboundClients 把 src inbound 的 settings.clients / settings.accounts 并入 dst,
+// 按协议主键去重。dst 是 dedupe 后保留的第一份,src 是要丢弃的副本(但其 clients 不能丢)。
+func mergeInboundClients(dst, src map[string]interface{}) {
+	dstSettings, _ := dst["settings"].(map[string]interface{})
+	srcSettings, _ := src["settings"].(map[string]interface{})
+	if dstSettings == nil || srcSettings == nil {
+		return
+	}
+	proto, _ := dst["protocol"].(string)
+	if p, _ := src["protocol"].(string); p != "" {
+		proto = p
+	}
+	arrKey := ""
+	switch strings.ToLower(proto) {
+	case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
+		arrKey = "clients"
+	case "socks", "http":
+		arrKey = "accounts"
+	default:
+		return
+	}
+	dstArr, _ := dstSettings[arrKey].([]interface{})
+	srcArr, _ := srcSettings[arrKey].([]interface{})
+	if len(srcArr) == 0 {
+		return
+	}
+	for _, sc := range srcArr {
+		sm, ok := sc.(map[string]interface{})
+		if !ok {
+			dstArr = append(dstArr, sc)
+			continue
+		}
+		dup := false
+		for _, dc := range dstArr {
+			if dm, ok := dc.(map[string]interface{}); ok && matchClientCredential(dm, sm, proto) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dstArr = append(dstArr, sc)
+		}
+	}
+	dstSettings[arrKey] = dstArr
+	dst["settings"] = dstSettings
 }
 
 // promoteInboundTagsToConfig 扫所有 xray 配置(主 config + confdir),
@@ -2229,6 +2375,11 @@ func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.C
 		}
 	}
 
+	// 写盘前最后一道兜底:把整个 inbounds 数组按 tag 去重。即使前面任何步骤手抖塞进了
+	// 重复 tag 的入站,这里会被收掉,xray 永远不会因"同 tag 两份"启动失败。
+	dedupeTaggedArrayInPlace(config, "inbounds")
+	dedupeTaggedArrayInPlace(config, "outbounds")
+
 	// 原子写文件:tmp + rename。同名旧文件被替换,xray reload 不会读到半截 JSON。
 	newContent, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -2554,6 +2705,10 @@ type RoutingRequest struct {
 	// add_user_to_rule / remove_user_from_rule:按 marktag 定位 routing rule,增删 rule.user[] 中的 email
 	Marktag   string `json:"marktag,omitempty"`
 	UserEmail string `json:"user_email,omitempty"`
+	// NoRestart=true 时 manageRouting 改完 config 不自动重启 xray。批量场景里主控会在循环末尾
+	// 自己统一重启所有受影响服务器,agent 不需要为每条路由变更都重启一次 — N 个路由出站节点串
+	// 行重启能省下 N×(1~3s),套餐绑用户感知最直接。
+	NoRestart bool `json:"no_restart,omitempty"`
 }
 
 // 处理路由管理请求。
@@ -2626,6 +2781,15 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 	if action == "" {
 		action = "set"
 	}
+
+	// inboundsMu 实际是"整个 xray config 文件"的锁。manageRouting 也读改写同一个文件,
+	// 不上锁会跟并发的 manageInbound / manageInboundClient race:
+	//   T1: add-client 加锁 → 读 config → 加 client → 写回 → 释放
+	//   T2: manageRouting 已读到 T1 之前的旧 config → 改 routing → 写回 → 把 T1 加的 client 擦掉
+	// 路由出站场景特别明显(routed 节点 = add-client + add_user_to_rule 紧挨着),
+	// 主控并发绑多个用户时该 race 概率随节点数线性放大。
+	h.inboundsMu.Lock()
+	defer h.inboundsMu.Unlock()
 
 	configPath := h.findXrayConfigPath()
 	if configPath == "" {
@@ -2767,7 +2931,14 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Manage] Routing config updated")
 
 	// xray routing 不支持动态加/改 rule(没有 gRPC API),必须重启进程才能加载新配置。
-	// 这里直接重启,主控调用方无需再单独触发。
+	// 默认 agent 自己重启;批量调用(主控套餐绑定 / 解绑)显式传 no_restart=true 让主控统一在末尾重启,避免 N 次串行重启。
+	if req.NoRestart {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Routing updated; xray restart deferred to caller",
+		})
+		return
+	}
 	if err := h.RestartXray(); err != nil {
 		log.Printf("[Manage] Routing 更新后重启 Xray 失败: %v", err)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2968,6 +3139,11 @@ func (h *ManageHandler) persistInbound(inbound map[string]interface{}) error {
 		inbounds = append(inbounds, inbound)
 	}
 	config["inbounds"] = inbounds
+
+	// 最后一道兜底:整组重新 dedupe,无论上面 if/else 路径走了哪条,
+	// 写盘前同 tag 数组里最多保留一份。
+	dedupeTaggedArrayInPlace(config, "inbounds")
+	dedupeTaggedArrayInPlace(config, "outbounds")
 
 	newContent, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -3326,6 +3502,16 @@ func (h *ManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 
 	if h.ensureRoutingRules(config) {
 		result.AddedSections = append(result.AddedSections, "routing_rules")
+		modified = true
+	}
+
+	// 兜底 tag 去重(这里是 agent 每次启动 + 任何配置写入都会经过的检查路径,挂一道保险)。
+	if removed := dedupeTaggedArrayInPlace(config, "inbounds"); removed > 0 {
+		result.AddedSections = append(result.AddedSections, fmt.Sprintf("dedupe_inbounds_removed=%d", removed))
+		modified = true
+	}
+	if removed := dedupeTaggedArrayInPlace(config, "outbounds"); removed > 0 {
+		result.AddedSections = append(result.AddedSections, fmt.Sprintf("dedupe_outbounds_removed=%d", removed))
 		modified = true
 	}
 
