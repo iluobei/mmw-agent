@@ -317,8 +317,13 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 
 	log.Printf("[Agent] Connecting to %s", u.String())
 
+	// WS 拨号 IPv4 优先,失败回退 IPv6 — 兼顾 IPv6-only 服务器。
+	// 历史问题:agent 上 IPv6 路由可用时 getaddrinfo 默认偏好 IPv6,WS 源 IP 变 v6,
+	// master 心跳兜底没拿到 PublicIPv4 时用源 IP 存进 db → IPv4-only 主控做 HTTP 反向请求
+	// 全 502。优先 v4 解决 dual-stack 主机的偏好问题,失败 v6 兜底保住纯 v6 服务器。
 	dialer := websocket.Dialer{
 		HandshakeTimeout: constants.WebSocketHandshakeTimeout,
+		NetDialContext:   preferV4DialContext,
 	}
 
 	conn, _, err := dialer.DialContext(ctx, u.String(), c.wsHeaders())
@@ -653,42 +658,87 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 	return c.writeEncrypted(conn, msg)
 }
 
+// preferV4DialContext 是 v4 优先 v6 兜底的 dialer。给 WS 拨号用 — getaddrinfo
+// 默认在 dual-stack 主机上优先 IPv6,导致 WS 源 IP 是 v6,master 兜底也存 v6 → IPv4-only
+// 主控反向 HTTP 请求 agent 全部 502。
+//
+// 时序:tcp4 留 3s 拨号窗口 —
+//   - 没有 v4 路由 / DNS 无 A 记录:syscall 立刻返回 ENETUNREACH(<10ms),
+//     不会拖累 IPv6-only 服务器
+//   - v4 通但慢:3s 内大部分网络环境都能连上
+//   - v4 真的废了:3s 后超时 → 走 v6 兜底,总耗时 ≤ 3+5=8s
+// tcp6 给完整 5s,避免双重缩短在弱网下都失败。
+func preferV4DialContext(ctx context.Context, _, addr string) (net.Conn, error) {
+	v4 := &net.Dialer{Timeout: 3 * time.Second}
+	if conn, err := v4.DialContext(ctx, "tcp4", addr); err == nil {
+		return conn, nil
+	}
+	v6 := &net.Dialer{Timeout: 5 * time.Second}
+	return v6.DialContext(ctx, "tcp6", addr)
+}
+
+// detectPublicIPv4 探测本机出口公网 IP。优先 IPv4,回退 IPv6 — 兼顾 IPv6-only 服务器。
+// 函数名保留 "v4" 是为了不破坏 wire payload 兼容性(master 心跳字段名是 public_ipv4),
+// 但实际返回可能是 v6 字符串,master 已能处理任意 IP literal。
+//
+// 探测策略:
+//  1. 用强制 tcp4 dialer 请求多个 IPv4 endpoint — 成功即返回 v4
+//  2. 全部失败(IPv4 不通 / 服务器是 IPv6-only)→ 用 tcp6 dialer 请求 v6 endpoint
+//  3. 还失败 → 返回空字符串
 func (c *Client) detectPublicIPv4() string {
-	urls := []string{"https://4.ipw.cn", "https://api4.ipify.org"}
-	client := &http.Client{Timeout: 5 * time.Second}
-	for _, u := range urls {
-		resp, err := client.Get(u)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		ip := strings.TrimSpace(string(body))
-		if ip != "" && !strings.Contains(ip, ":") {
-			return ip
+	// v4 探测 3s,v6 探测 5s — 与 preferV4DialContext 同款时序
+	makeClient := func(network string, timeout time.Duration) *http.Client {
+		dialer := &net.Dialer{Timeout: timeout}
+		return &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+					return dialer.DialContext(ctx, network, addr)
+				},
+				TLSHandshakeTimeout: timeout,
+			},
 		}
 	}
-	// fallback: try to get any public IP (may be IPv6)
-	fallbackURLs := []string{"https://ipw.cn", "https://api64.ipify.org"}
-	for _, u := range fallbackURLs {
-		resp, err := client.Get(u)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		ip := strings.TrimSpace(string(body))
-		if ip != "" {
+	probe := func(client *http.Client, urls []string, want4 bool) string {
+		for _, u := range urls {
+			resp, err := client.Get(u)
+			if err != nil {
+				continue
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				continue
+			}
+			ip := strings.TrimSpace(string(body))
+			parsed := net.ParseIP(ip)
+			if parsed == nil {
+				continue
+			}
+			isV4 := parsed.To4() != nil
+			if want4 && !isV4 {
+				continue
+			}
 			return ip
 		}
+		return ""
 	}
-	return ""
+	// 1) 强制 IPv4(3s)
+	if ip := probe(makeClient("tcp4", 3*time.Second), []string{
+		"https://4.ipw.cn",
+		"https://api4.ipify.org",
+		"https://ipv4.icanhazip.com",
+		"https://v4.ident.me",
+	}, true); ip != "" {
+		return ip
+	}
+	// 2) IPv4 拿不到 → 试 IPv6(5s)
+	return probe(makeClient("tcp6", 5*time.Second), []string{
+		"https://6.ipw.cn",
+		"https://api6.ipify.org",
+		"https://ipv6.icanhazip.com",
+		"https://v6.ident.me",
+	}, false)
 }
 
 // SetEmbeddedXray 设置嵌入模式的 Xray 实例。
@@ -841,8 +891,10 @@ func (c *Client) tryWebSocketOnce(ctx context.Context) error {
 	}
 	u.Path = constants.PathRemoteWebSocket
 
+	// 同 connectAndRun:探测拨号也走 v4 优先 v6 兜底,保持探测和正式连接同一选择
 	dialer := websocket.Dialer{
 		HandshakeTimeout: constants.WebSocketHandshakeTimeout,
+		NetDialContext:   preferV4DialContext,
 	}
 
 	conn, _, err := dialer.DialContext(ctx, u.String(), c.wsHeaders())
