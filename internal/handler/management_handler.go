@@ -2937,8 +2937,36 @@ func (h *ManageHandler) persistInbound(inbound map[string]interface{}) error {
 		return fmt.Errorf("failed to parse config: %w", err)
 	}
 
+	// 按 tag 去重:同 tag 已存在则替换,不存在再 append。
+	// 防止主控老代码 `GET → modify → POST remove + POST add` 在并发下因竞态丢 remove 而 append 出多份(case:套餐绑用户的 4 个 POST 在 inboundsMu 内序列化后,
+	//   M1.remove → 0
+	//   M2.remove → 0
+	//   M1.add    → 1
+	//   M2.add    → 持续 append 出 2 份
+	// 历史上 us-a / Akko SJC 的 vless-443 被复制成 3 份就是这个原因)。
+	// agent inboundsMu 已经能挡跨连接的并发,但 persistInbound 自己幂等才是最后一道兜底。
+	newTag, _ := inbound["tag"].(string)
 	inbounds, _ := config["inbounds"].([]interface{})
-	inbounds = append(inbounds, inbound)
+	if newTag != "" {
+		replaced := false
+		for i, ib := range inbounds {
+			m, ok := ib.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t, _ := m["tag"].(string); t == newTag {
+				inbounds[i] = inbound
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			inbounds = append(inbounds, inbound)
+		}
+	} else {
+		// tag 缺失的退化路径(理论上 listInbounds 的 promote 应该把它补上,此处只兜底)
+		inbounds = append(inbounds, inbound)
+	}
 	config["inbounds"] = inbounds
 
 	newContent, err := json.MarshalIndent(config, "", "  ")
