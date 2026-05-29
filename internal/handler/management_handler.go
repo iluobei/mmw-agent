@@ -4439,7 +4439,7 @@ echo "Binary replaced; agent will exit and systemd will restart with new version
 	// 注:systemd 模式下不 detach,避免与 systemd 的 restart 抢端口。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		if systemdWillRestartAgent() {
+		if someoneWillRestartAgent() {
 			log.Printf("[Manage] Exiting after agent upgrade (systemd will restart with new binary)")
 		} else {
 			log.Printf("[Manage] No systemd-managed agent service detected; scheduling self-respawn")
@@ -4449,20 +4449,31 @@ echo "Binary replaced; agent will exit and systemd will restart with new version
 	}()
 }
 
-// systemdWillRestartAgent 判断当前 agent 是否由 systemd 管理且会自动 restart。
-// 两个条件同时满足:
-//   - /run/systemd/system 存在(说明 init 是 systemd)
-//   - systemctl is-active mmw-agent 返回成功(说明这个服务在被管理)
-// LXC / docker / openrc / nohup 等任一不满足就走自重启分支。
-func systemdWillRestartAgent() bool {
-	if _, err := os.Stat("/run/systemd/system"); err != nil {
-		return false
+// someoneWillRestartAgent 判断当前 agent 退出后是否有外部 supervisor 会自动拉起新进程。
+// 任一命中即返回 true,scheduleSelfRespawn 应跳过 — 否则会跟 supervisor 双开抢端口,
+// 出现"两个 mmw-agent 进程同时启动 → 一个 bind 失败循环退出 → 持续 flap"的现象。
+//
+// 识别顺序:
+//  1. systemd:/run/systemd/system 存在 + systemctl is-active mmw-agent
+//  2. OpenRC / runit / s6:agent 的父进程是已知 supervisor(supervise-daemon / runsv / s6-supervise)
+func someoneWillRestartAgent() bool {
+	// 1) systemd
+	if _, err := os.Stat("/run/systemd/system"); err == nil {
+		if out, err := exec.Command("systemctl", "is-active", "mmw-agent").Output(); err == nil {
+			if strings.TrimSpace(string(out)) == "active" {
+				return true
+			}
+		}
 	}
-	out, err := exec.Command("systemctl", "is-active", "mmw-agent").Output()
-	if err != nil {
-		return false
+	// 2) 父进程是已知 supervisor — 兜住 LXC + OpenRC supervise-daemon、runit、s6 等场景
+	if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", os.Getppid())); err == nil {
+		name := strings.TrimSpace(string(data))
+		switch name {
+		case "supervise-daemon", "runsv", "s6-supervise":
+			return true
+		}
 	}
-	return strings.TrimSpace(string(out)) == "active"
+	return false
 }
 
 // scheduleSelfRespawn 在当前进程退出前 fork 一个完全脱离的子进程,
