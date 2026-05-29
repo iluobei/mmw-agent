@@ -5,6 +5,9 @@
 <details>
 <summary>更新日志</summary>
 
+### v0.1.7 (2026-05-29)
+- 🛠️ fix:OpenRC LXC 双开 mmw-agent
+
 ### v0.1.6 (2026-05-29)
 - 🛠️ fix:偶发重复复制入站
 
