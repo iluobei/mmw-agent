@@ -215,24 +215,28 @@ func main() {
 	// (否则 ListenAndServe 失败但 WebSocket 出站还活,会造成 agent HTTP API 死、
 	//  主控误以为"在线"无法触达的死锁状态)
 	//
-	// 端口冲突自适应:agent 默认 23889,如果用户的 xray inbound 已经占了 23889
-	// (常见于从老 mmw / 已有 xray 服务器迁移过来的场景,embedded xray 内部 bind 该端口),
-	// 这里会自动找下一个空闲端口并写回 config.yaml,避免 restart 死循环。
-	if newPort, ok := resolveListenPortConflict(cfg.ListenPort); ok {
-		log.Printf("[Main] Agent port %s conflict (likely xray inbound); switching to %d and persisting", cfg.ListenPort, newPort)
-		cfg.ListenPort = fmt.Sprintf("%d", newPort)
-		server.Addr = ":" + cfg.ListenPort
-		if err := persistListenPort(cfgFile, cfg.ListenPort); err != nil {
-			log.Printf("[Main] Warn: failed to persist new listen_port to %s: %v (next restart will re-detect)", cfgFile, err)
-		}
-	}
-
-	// EADDRINUSE 重试:Restart=always + RestartSec=5 的快速循环里,
-	// 上一实例的 LISTEN socket 可能还没被内核完全回收;直接 fail 会触发又一轮重启循环。
-	// 这里轮询最多 ~12s,绝大多数情况下旧 FD 释放后能成功 bind。
+	// 端口冲突处理顺序:**先死磕原端口,再考虑切换**(历史 BUG:顺序反了 → 上次实例的
+	// orphan / TIME_WAIT 套接字短暂占港 → 立刻切端口并 persist → 用户配的 NAT 端口转发
+	// 全部失效 → 主控反向 HTTP 全 502。LXC 案例就是这个。)
+	//
+	//   1. listenWithRetry 在原端口轮询 12s,期间还会主动 kill 别的 mmw-agent 进程。
+	//      80%+ 的"冲突"其实是 systemd 快速重启导致的 socket 没释放 / orphan,这个阶段就解决。
+	//   2. 真的拼不下来才切端口 + persist。这种情况通常是另一个真实进程(xray inbound /
+	//      用户自建服务等)长期占港,持久切换是合理的。
 	httpLn, err := listenWithRetry("tcp", server.Addr, 6, 2*time.Second)
 	if err != nil {
-		log.Fatalf("[Main] HTTP server bind failed on :%s: %v", cfg.ListenPort, err)
+		if newPort, ok := resolveListenPortConflict(cfg.ListenPort); ok {
+			log.Printf("[Main] Original port %s stuck after 12s retry; switching to %d and persisting", cfg.ListenPort, newPort)
+			cfg.ListenPort = fmt.Sprintf("%d", newPort)
+			server.Addr = ":" + cfg.ListenPort
+			if err := persistListenPort(cfgFile, cfg.ListenPort); err != nil {
+				log.Printf("[Main] Warn: failed to persist new listen_port to %s: %v (next restart will re-detect)", cfgFile, err)
+			}
+			httpLn, err = net.Listen("tcp", server.Addr)
+		}
+		if err != nil {
+			log.Fatalf("[Main] HTTP server bind failed on :%s: %v", cfg.ListenPort, err)
+		}
 	}
 	go func() {
 		log.Printf("[Main] HTTP server listening on :%s", cfg.ListenPort)

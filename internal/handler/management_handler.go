@@ -4433,18 +4433,29 @@ echo "Binary replaced; agent will exit and systemd will restart with new version
 		log.Printf("[Manage] Agent upgrade script failed; not exiting")
 		return
 	}
-	// 延迟一点让 SSE complete 消息真的发到客户端,再退出。
-	// 默认假设有 systemd 拉起新二进制;LXC 等无 systemd 环境(`/run/systemd/system` 不存在或服务未注册)
-	// 退出后没人接管 → 手动 detach 一个新进程 sleep 2s 后 exec 新二进制,跨过当前进程退出释放端口的窗口。
-	// 注:systemd 模式下不 detach,避免与 systemd 的 restart 抢端口。
+	// 升级完成后:不调 os.Exit,而是 syscall.Exec 把当前进程"原地替换"成新 binary。
+	// 优势 — 跟 supervisor 解耦:
+	//   - PID 不变 → systemd / supervise-daemon 看不到子进程退出 → 不会触发 restart → 没有
+	//     "supervisor respawn 抢 socket"的 race(OpenRC supervise-daemon 上特别明显:
+	//      rc-service restart 自己都能因为 respawn_delay race 创出双开,何况升级路径)
+	//   - 不需要 self-respawn fork → 没有"自己 fork 一个 + supervisor 又来一个"双开
+	//   - 唯一的副作用:embedded xray 在 exec 那一刹那一起死,新 binary 启动时重读 config 重建。
+	//     已经是升级的预期行为。
+	//
+	// 500ms 让 SSE complete 真的送到客户端。失败兜底 os.Exit。
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		if someoneWillRestartAgent() {
-			log.Printf("[Manage] Exiting after agent upgrade (systemd will restart with new binary)")
-		} else {
-			log.Printf("[Manage] No systemd-managed agent service detected; scheduling self-respawn")
-			scheduleSelfRespawn()
+		binPath, err := os.Executable()
+		if err != nil || binPath == "" {
+			binPath = "/usr/local/bin/mmw-agent"
 		}
+		log.Printf("[Manage] Self-exec %s after upgrade (PID unchanged, no supervisor restart needed)", binPath)
+		if execErr := syscall.Exec(binPath, os.Args, os.Environ()); execErr != nil {
+			// 极端情况(binary 被删 / 权限错误)走老退出路径让 supervisor 拉起
+			log.Printf("[Manage] Self-exec failed: %v; falling back to exit and let supervisor restart", execErr)
+			os.Exit(0)
+		}
+		// 正常情况下 syscall.Exec 永远不返回。代码到这里说明返回 nil 又没 exec 成功(几乎不可能),兜底退出。
 		os.Exit(0)
 	}()
 }
