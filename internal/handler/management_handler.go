@@ -4168,9 +4168,12 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     fi
 fi
 if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o /tmp/mmw-agent-new "$RELEASE_URL"
+    # --connect-timeout: TCP 握手最长 10s
+    # --max-time:     整个传输上限 180s — GitHub CDN 偶发卡死时,不加 max-time 会无声 hang
+    #                 (历史问题:client 取消后 agent 这边 sseStreamCmd 跟着 cmd.Wait 一起永远等下去)
+    curl -fsSL --connect-timeout 10 --max-time 180 -o /tmp/mmw-agent-new "$RELEASE_URL"
 else
-    wget -q --show-progress -O /tmp/mmw-agent-new "$RELEASE_URL"
+    wget -q --show-progress --connect-timeout=10 --read-timeout=180 -O /tmp/mmw-agent-new "$RELEASE_URL"
 fi
 
 chmod +x /tmp/mmw-agent-new
@@ -4186,16 +4189,32 @@ mv -f /usr/local/bin/mmw-agent.new /usr/local/bin/mmw-agent
 rm -f /tmp/mmw-agent-new
 echo "Binary replaced; agent will exit and systemd will restart with new version."
 `
-	cmd := exec.CommandContext(r.Context(), "bash", "-c", script)
+	// 整个升级流程兜底超时 5 分钟 — 包括 GitHub 下载、二进制写入、SSE 流。
+	// 之前没设上限,sseStreamCmd 卡在 cmd.Wait + SSE 写之间能挂 2+ 天不释放 handler 协程
+	// (us-a.2ha.me 实例:"Starting Agent upgrade" 日志后再无任何后续日志,goroutine 永久泄漏)。
+	// CommandContext 收到 cancel 会 SIGKILL bash,sseStreamCmd 在 r.Context().Done() 分支返回,
+	// streamDone 写 false → 日志 "script failed" → handler 干净退出。
+	upgradeCtx, upgradeCancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer upgradeCancel()
+	cmdReq := r.Clone(upgradeCtx)
+	cmd := exec.CommandContext(upgradeCtx, "bash", "-c", script)
 	cmd.Env = os.Environ()
 	// sseStreamCmd 内部 Wait() 完命令才返回,所以 script 成功跑完(包括 cp 替换二进制)后这里才走到下面
 	// 用 channel 让 sseStreamCmd 阻塞期间不退出,完成后 os.Exit。
 	streamDone := make(chan bool, 1)
 	go func() {
-		sseStreamCmd(w, r, cmd, "Agent upgraded, restarting...")
+		sseStreamCmd(w, cmdReq, cmd, "Agent upgraded, restarting...")
 		streamDone <- (cmd.ProcessState != nil && cmd.ProcessState.Success())
 	}()
-	success := <-streamDone
+	var success bool
+	select {
+	case success = <-streamDone:
+	case <-time.After(6 * time.Minute):
+		// 超过 sseStreamCmd 自身应该在 upgradeCtx (5min) 后退出的时间,仍未结束 → 强制兜底
+		log.Printf("[Manage] Agent upgrade hard timeout (>6min); abandoning goroutine and giving up")
+		upgradeCancel()
+		return
+	}
 	if !success {
 		log.Printf("[Manage] Agent upgrade script failed; not exiting")
 		return
