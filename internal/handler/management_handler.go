@@ -41,6 +41,11 @@ type ManageHandler struct {
 	embeddedXray         *embedded.EmbeddedXray
 	embeddedMu           sync.Mutex
 	onEmbeddedXrayStart  func(*embedded.EmbeddedXray)
+	// inboundsMu 串行化所有 manageInbound 操作(包括新的 add-client/remove-client),
+	// 防止主控并发绑多个用户时:1) 配置文件 read-modify-write 撕裂;
+	// 2) 主控旧 GET→remove+add 路径下相互覆盖丢 client。
+	// 配置文件只有一份,锁不需要 per-inbound 粒度,直接 handler 全局即可。
+	inboundsMu           sync.Mutex
 }
 
 // 创建管理处理器。
@@ -1606,6 +1611,10 @@ type InboundRequest struct {
 	Action  string                 `json:"action"`
 	Inbound map[string]interface{} `json:"inbound,omitempty"`
 	Tag     string                 `json:"tag,omitempty"`
+	// 仅 action=add-client/remove-client 使用:要新增 / 匹配移除的单个客户端凭据。
+	// add 场景按协议放进 settings.clients(VLESS/VMess/Trojan/Hysteria/Shadowsocks)
+	// 或 settings.accounts(SOCKS/HTTP);remove 场景按 matchCredentialMap 同字段匹配。
+	Client map[string]interface{} `json:"client,omitempty"`
 }
 
 // 处理入站管理请求。
@@ -1913,8 +1922,20 @@ func (h *ManageHandler) manageInbound(w http.ResponseWriter, r *http.Request) {
 		action = "add"
 	}
 
+	// 全局串行化 — 见 inboundsMu 字段注释。所有 inbound CRUD(包括新的 add-client / remove-client)
+	// 走同一把锁,避免并发请求间的 read-modify-write 撕裂。
+	h.inboundsMu.Lock()
+	defer h.inboundsMu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// 新的原子动作:无论 embedded / external 都共享同一份配置文件,实现可以通用化。
+	switch action {
+	case "add-client", "remove-client":
+		h.manageInboundClient(w, ctx, action, &req)
+		return
+	}
 
 	if h.xrayMode == "embedded" && h.embeddedXray != nil {
 		h.manageInboundEmbedded(w, ctx, action, &req)
@@ -2090,6 +2111,218 @@ func (h *ManageHandler) manageInboundEmbedded(w http.ResponseWriter, ctx context
 	default:
 		writeError(w, http.StatusBadRequest, "Invalid action. Must be 'add' or 'remove'")
 	}
+}
+
+// manageInboundClient 在 inboundsMu 锁内原子地新增/移除一个 client。
+//
+// 主控以前的流程是 GET(取 inbound 快照) → 在自己进程里 append client → POST remove(tag) → POST add(inbound)。
+// 跨多个 HTTP 来回,并发时两个用户都基于同一份快照修改 → 后写的覆盖先写的 → 丢 client。
+// 把整段操作搬到 agent 这边、由 inboundsMu 串行化,主控只需一次 POST 即可。
+//
+// 复用现有 manageInbound add/remove 路径作为底层运行时应用,避免重写 xray runtime 调用。
+func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.Context, action string, req *InboundRequest) {
+	if req.Tag == "" {
+		writeError(w, http.StatusBadRequest, "tag is required")
+		return
+	}
+	if req.Client == nil {
+		writeError(w, http.StatusBadRequest, "client is required")
+		return
+	}
+
+	configPath := h.findXrayConfigPath()
+	if configPath == "" {
+		writeError(w, http.StatusNotFound, "Xray config not found")
+		return
+	}
+
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("read config: %v", err))
+		return
+	}
+	var config map[string]interface{}
+	if err := json.Unmarshal(content, &config); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("parse config: %v", err))
+		return
+	}
+
+	inbounds, _ := config["inbounds"].([]interface{})
+	var target map[string]interface{}
+	for _, ib := range inbounds {
+		m, ok := ib.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := m["tag"].(string); t == req.Tag {
+			target = m
+			break
+		}
+	}
+	if target == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("inbound %s not found", req.Tag))
+		return
+	}
+
+	protocol, _ := target["protocol"].(string)
+	settings, _ := target["settings"].(map[string]interface{})
+	if settings == nil {
+		settings = map[string]interface{}{}
+		target["settings"] = settings
+	}
+
+	// 不同协议把客户端凭据放在 settings.clients 或 settings.accounts;协议未知则拒绝。
+	var arrKey string
+	switch strings.ToLower(protocol) {
+	case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
+		arrKey = "clients"
+	case "socks", "http":
+		arrKey = "accounts"
+	default:
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unsupported protocol: %s", protocol))
+		return
+	}
+	arr, _ := settings[arrKey].([]interface{})
+
+	switch action {
+	case "add-client":
+		// 幂等:已经在里面就直接返回,不写文件、不触发 runtime 重装。
+		for _, c := range arr {
+			if m, ok := c.(map[string]interface{}); ok && matchClientCredential(m, req.Client, protocol) {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"success": true,
+					"message": "client already present (no-op)",
+				})
+				return
+			}
+		}
+		arr = append(arr, req.Client)
+	case "remove-client":
+		filtered := arr[:0:0]
+		removed := 0
+		for _, c := range arr {
+			if m, ok := c.(map[string]interface{}); ok && matchClientCredential(m, req.Client, protocol) {
+				removed++
+				continue
+			}
+			filtered = append(filtered, c)
+		}
+		if removed == 0 {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "client not found (no-op)",
+			})
+			return
+		}
+		arr = filtered
+	}
+	settings[arrKey] = arr
+	target["settings"] = settings
+
+	// 剥掉 enumeration metadata(_generated_tag 等)再写盘,跟主控旧路径同款清理。
+	for k := range target {
+		if strings.HasPrefix(k, "_") {
+			delete(target, k)
+		}
+	}
+
+	// 原子写文件:tmp + rename。同名旧文件被替换,xray reload 不会读到半截 JSON。
+	newContent, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("marshal config: %v", err))
+		return
+	}
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, newContent, 0644); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("write tmp config: %v", err))
+		return
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		os.Remove(tmp)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("rename config: %v", err))
+		return
+	}
+
+	// 运行时应用:remove 旧 inbound + add 新 inbound。在 inboundsMu 内顺序执行,
+	// 不会和别的 add/remove 交错。失败也只警告 — 配置文件已经是新版,xray 下次重启就生效。
+	if err := h.replaceRuntimeInbound(ctx, req.Tag, target); err != nil {
+		log.Printf("[Manage] manageInboundClient: runtime apply failed (tag=%s): %v; config file already updated", req.Tag, err)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success":         true,
+			"message":         fmt.Sprintf("client %s persisted to config, runtime apply deferred", action),
+			"runtime_warning": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("client %sd", action),
+	})
+}
+
+// replaceRuntimeInbound 在 xray 运行态把 tag 对应的 inbound 替换成 newInbound。
+// embedded 模式走内嵌 RemoveInbound + AddInbound;外置模式走 HandlerService gRPC。
+// 调用方必须已经持有 inboundsMu。
+func (h *ManageHandler) replaceRuntimeInbound(ctx context.Context, tag string, newInbound map[string]interface{}) error {
+	if h.xrayMode == "embedded" && h.embeddedXray != nil {
+		inboundJSON, err := json.Marshal(newInbound)
+		if err != nil {
+			return fmt.Errorf("marshal inbound: %w", err)
+		}
+		inboundConfig := &conf.InboundDetourConfig{}
+		if err := json.Unmarshal(inboundJSON, inboundConfig); err != nil {
+			return fmt.Errorf("parse inbound config: %w", err)
+		}
+		rawConfig, err := inboundConfig.Build()
+		if err != nil {
+			return fmt.Errorf("build inbound config: %w", err)
+		}
+		_ = h.embeddedXray.RemoveInbound(tag) // 不存在不算错
+		return h.embeddedXray.AddInbound(rawConfig)
+	}
+
+	apiPort := h.findXrayAPIPort()
+	if apiPort == 0 {
+		return fmt.Errorf("xray API port not found")
+	}
+	clients, err := xrpc.New(ctx, constants.LocalhostIP, uint16(apiPort))
+	if err != nil {
+		return fmt.Errorf("connect xray: %w", err)
+	}
+	defer clients.Connection.Close()
+	_ = h.removeInbound(ctx, clients.Handler, tag)
+	return h.addInbound(ctx, clients.Handler, newInbound)
+}
+
+// matchClientCredential 按协议字段比对两个 client/account 是否同一身份。
+// 优先看协议主键(id/password/auth/user),其次回退到 email — 路由出站清理子账号时,
+// 主控只持有 email,没有完整凭据,需要这条 email 回退路径。
+// 主键和 email 任一字段在两侧都非空且相等即视为命中。
+func matchClientCredential(a, b map[string]interface{}, protocol string) bool {
+	bothNonEmptyEq := func(k string) bool {
+		av := fmt.Sprint(a[k])
+		bv := fmt.Sprint(b[k])
+		if av == "" || av == "<nil>" || bv == "" || bv == "<nil>" {
+			return false
+		}
+		return av == bv
+	}
+	var primaryKey string
+	switch strings.ToLower(protocol) {
+	case "vless", "vmess":
+		primaryKey = "id"
+	case "trojan", "shadowsocks":
+		primaryKey = "password"
+	case "hysteria":
+		primaryKey = "auth"
+	case "socks", "http":
+		primaryKey = "user"
+	}
+	if primaryKey != "" && bothNonEmptyEq(primaryKey) {
+		return true
+	}
+	return bothNonEmptyEq("email")
 }
 
 // ================== Xray 出站管理 ==================
