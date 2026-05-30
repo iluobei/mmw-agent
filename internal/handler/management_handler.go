@@ -225,6 +225,16 @@ func (h *ManageHandler) lazyStartEmbeddedXray() error {
 
 // 校验请求身份（token + User-Agent）。
 func (h *ManageHandler) authenticate(r *http.Request) bool {
+	// WS RPC 路径:请求由 client.go 的 handleRPCCall 构造内存 *http.Request 喂给共享 mux,
+	// WS 层已经做了 securechan ECDH + token + capabilities 验证,此处放行不再做 Bearer 检查。
+	// 该头由 agent 自己内部设置,真正从外部网络收到带这个头的请求也不能绕过 WS 认证 —
+	// 因为 HTTP listener 上没有 WS 层,真正的 X-WS-RPC 仅出现在我们内部 ServeHTTP 调用里。
+	// 不过保险起见,只要外部能伪造头,就把 listener 上的也卡住:WS RPC 入口走 net/http 内存,
+	// 不经过 listener,所以判断 RemoteAddr=="ws-rpc"(由 dispatcher 强制设置)是更稳的标记。
+	if r.Header.Get("X-WS-RPC") == "1" && r.RemoteAddr == "ws-rpc" {
+		return true
+	}
+
 	if r.Header.Get(constants.HeaderUserAgent) != constants.AgentUserAgent {
 		return false
 	}

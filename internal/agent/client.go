@@ -99,6 +99,16 @@ type Client struct {
 
 	// 公网 IPv4 缓存
 	publicIPv4 string
+
+	// 反向 RPC 路由表 — 跟普通 HTTP mux 共享同一份 /api/child/* handler 实例,
+	// 区别仅在请求是从 WS 帧解出来构造的 *http.Request,而不是从 net.Listener 收来的。
+	// nil = 主程序未注入 → handleRPCCall 直接报 503 错回 master,master 自动 fallback HTTP。
+	rpcMux *http.ServeMux
+}
+
+// SetRPCMux 由 main.go 在注册完 /api/child/* 路由后注入。共享 mux 让 WS RPC 路径完全复用现有 handler。
+func (c *Client) SetRPCMux(mux *http.ServeMux) {
+	c.rpcMux = mux
 }
 
 // 创建 agent 客户端。
@@ -382,8 +392,22 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 
 // 发送鉴权消息。
 func (c *Client) authenticate(conn *websocket.Conn) error {
-	authPayload, _ := json.Marshal(map[string]string{
-		"token": c.config.Token,
+	// auth 时把缓存的 public_ipv4 也带上,让 master 在第一次 heartbeat 到来之前(~10s 窗口)
+	// 就有正确的 v4 IP 可用,避开 master 重启 → preferV4DialContext 偶尔 v6 → auth 时 master
+	// 用 WS 源 IP (v6) 写 db → master 反向请求 agent 走 v6 → 失败 的时序问题。
+	// publicIPv4 在首次 sendHeartbeat 时才 detect,所以这里同样懒加载一次,避免空字段。
+	if c.publicIPv4 == "" {
+		c.publicIPv4 = c.detectPublicIPv4()
+	}
+	// capabilities.rpc = true 告诉 master 本 agent 能接 WSMsgTypeRPCCall,master 可以把
+	// 原本走 HTTP /api/child/* 的反向调用切到 WS,绕开 IPv6 漂移 / NAT 反向不通的痛点。
+	// rpcMux 没注入(老路径或测试场景)时报 false,master 继续走 HTTP。
+	authPayload, _ := json.Marshal(map[string]any{
+		"token":       c.config.Token,
+		"public_ipv4": c.publicIPv4,
+		"capabilities": map[string]bool{
+			"rpc": c.rpcMux != nil,
+		},
 	})
 
 	msg := map[string]interface{}{
@@ -1453,6 +1477,8 @@ const (
 	WSMsgTypeLimiterConfig       = "limiter_config"
 	WSMsgTypeLicenseStatus       = "license_status"
 	WSMsgTypeConfigUpdate        = "config_update"
+	WSMsgTypeRPCCall             = "rpc_call"  // master 反向 RPC 请求(替代 /api/child/* HTTP)
+	WSMsgTypeRPCReply            = "rpc_reply" // agent 执行后返回响应
 )
 
 // WSCertDeployPayload 是主控端下发的证书部署指令。
@@ -1588,6 +1614,15 @@ func (c *Client) handleMessage(conn *websocket.Conn, message []byte) {
 			return
 		}
 		c.handleConfigUpdate(payload)
+	case WSMsgTypeRPCCall:
+		// master 反向 RPC:把 payload 转成 *http.Request 喂给共享的 rpcMux,响应回 master。
+		// 必须 go 起新协程 — handler 内部可能阻塞数秒(xray restart / 路由切换等),不能堵主循环。
+		var payload WSRPCCallPayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Printf("[Agent] Failed to parse rpc_call payload: %v", err)
+			return
+		}
+		go c.handleRPCCall(conn, payload)
 	default:
 		// 忽略未知消息类型
 	}

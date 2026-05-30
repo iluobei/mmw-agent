@@ -175,6 +175,11 @@ func main() {
 	mux := http.NewServeMux()
 	handler.RegisterChildRoutes(mux, apiHandler, manageHandler)
 
+	// 注入 mux 给 client,让 WS RPC 路径(master 反向调用)能复用同一份 /api/child/* handler
+	// 实例。共享 mux 意味着 handler 任何后续 bug fix 都同时覆盖 HTTP 和 WS RPC 路径。
+	// agent auth payload 会据此上报 capabilities.rpc=true。
+	agentClient.SetRPCMux(mux)
+
 	// 健康检查
 	mux.HandleFunc(constants.PathHealth, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
