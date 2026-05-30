@@ -401,12 +401,15 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	}
 	// capabilities.rpc = true 告诉 master 本 agent 能接 WSMsgTypeRPCCall,master 可以把
 	// 原本走 HTTP /api/child/* 的反向调用切到 WS,绕开 IPv6 漂移 / NAT 反向不通的痛点。
-	// rpcMux 没注入(老路径或测试场景)时报 false,master 继续走 HTTP。
+	// capabilities.stream = true 告诉 master 本 agent 还能跑 rpc_call(Stream:true) → rpc_stream_data
+	// 流式协议,可替代 /api/child/xxx-stream SSE。两者实际依赖同一份 rpcMux,所以一起 toggle。
+	rpcAvailable := c.rpcMux != nil
 	authPayload, _ := json.Marshal(map[string]any{
 		"token":       c.config.Token,
 		"public_ipv4": c.publicIPv4,
 		"capabilities": map[string]bool{
-			"rpc": c.rpcMux != nil,
+			"rpc":    rpcAvailable,
+			"stream": rpcAvailable,
 		},
 	})
 
@@ -1477,8 +1480,9 @@ const (
 	WSMsgTypeLimiterConfig       = "limiter_config"
 	WSMsgTypeLicenseStatus       = "license_status"
 	WSMsgTypeConfigUpdate        = "config_update"
-	WSMsgTypeRPCCall             = "rpc_call"  // master 反向 RPC 请求(替代 /api/child/* HTTP)
-	WSMsgTypeRPCReply            = "rpc_reply" // agent 执行后返回响应
+	WSMsgTypeRPCCall             = "rpc_call"        // master 反向 RPC 请求(替代 /api/child/* HTTP)
+	WSMsgTypeRPCReply            = "rpc_reply"       // agent 执行后返回响应(流式调用也用它作 end 帧)
+	WSMsgTypeRPCStreamData       = "rpc_stream_data" // 流式调用中间数据帧 — 替代 /api/child/xxx-stream SSE
 )
 
 // WSCertDeployPayload 是主控端下发的证书部署指令。

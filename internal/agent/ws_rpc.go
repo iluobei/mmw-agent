@@ -31,14 +31,23 @@ type WSRPCCallPayload struct {
 	Query     string          `json:"query,omitempty"`
 	Body      json.RawMessage `json:"body,omitempty"`
 	TimeoutMs int             `json:"timeout_ms,omitempty"`
+	// Stream=true 时本次调用走流式路径:handler 每次 Flush() 触发一帧 rpc_stream_data,
+	// handler 返回后再发 rpc_reply 作为结束帧。
+	Stream bool `json:"stream,omitempty"`
 }
 
-// WSRPCReplyPayload 跟 master 端对齐。
+// WSRPCReplyPayload 跟 master 端对齐。流式调用复用它作 end 帧。
 type WSRPCReplyPayload struct {
 	RequestID string          `json:"request_id"`
 	Status    int             `json:"status"`
 	Body      json.RawMessage `json:"body,omitempty"`
 	Error     string          `json:"error,omitempty"`
+}
+
+// WSRPCStreamDataPayload 流式中间数据帧。
+type WSRPCStreamDataPayload struct {
+	RequestID string `json:"request_id"`
+	Data      string `json:"data"`
 }
 
 // bufferResponseWriter 实现 http.ResponseWriter,把所有写入累积到内存 buffer。
@@ -65,9 +74,18 @@ func (w *bufferResponseWriter) WriteHeader(status int) {
 	w.status = status
 }
 
-// handleRPCCall 收到一条 rpc_call,把它转成 *http.Request 喂给 rpcMux,响应回 master。
+// handleRPCCall 入口 — 流式路径调 handleRPCStreamCall,普通路径走下面的 buffer 模式。
 // 由 message dispatcher 在 go 协程里调用,确保不堵主 read 循环。
 func (c *Client) handleRPCCall(conn *websocket.Conn, p WSRPCCallPayload) {
+	if p.Stream {
+		c.handleRPCStreamCall(conn, p)
+		return
+	}
+	c.handleRPCCallBuffer(conn, p)
+}
+
+// handleRPCCallBuffer 普通(非流)RPC:buffer 接住整段响应,一次 rpc_reply 发回。
+func (c *Client) handleRPCCallBuffer(conn *websocket.Conn, p WSRPCCallPayload) {
 	reply := WSRPCReplyPayload{RequestID: p.RequestID}
 
 	defer func() {
@@ -141,5 +159,111 @@ func (c *Client) sendRPCReply(conn *websocket.Conn, reply WSRPCReplyPayload) {
 	}
 	if err := c.writeEncrypted(conn, msg); err != nil {
 		log.Printf("[Agent] send rpc_reply failed (request_id=%s): %v", reply.RequestID, err)
+	}
+}
+
+// ================== 流式 RPC(替代 SSE)==================
+
+// streamingResponseWriter 实现 http.ResponseWriter + http.Flusher。
+// 每次 handler 调 Flush() → 把 buf 累积的字节作为一帧 rpc_stream_data 发给 master,然后 reset buf。
+// handler 返回后还会被 handleRPCStreamCall 兜底再 Flush 一次,保证收尾的残留 buf 也送出去。
+type streamingResponseWriter struct {
+	headers   http.Header
+	status    int
+	buf       bytes.Buffer
+	requestID string
+	conn      *websocket.Conn
+	sender    func(conn *websocket.Conn, reqID string, data []byte)
+}
+
+func newStreamingResponseWriter(conn *websocket.Conn, reqID string, sender func(*websocket.Conn, string, []byte)) *streamingResponseWriter {
+	return &streamingResponseWriter{
+		headers:   make(http.Header),
+		status:    http.StatusOK,
+		requestID: reqID,
+		conn:      conn,
+		sender:    sender,
+	}
+}
+
+func (w *streamingResponseWriter) Header() http.Header        { return w.headers }
+func (w *streamingResponseWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
+func (w *streamingResponseWriter) WriteHeader(s int)            { w.status = s }
+func (w *streamingResponseWriter) Flush() {
+	if w.buf.Len() == 0 {
+		return
+	}
+	// copy 一份,避免 sender 异步执行时 buf reset 破坏数据
+	data := append([]byte(nil), w.buf.Bytes()...)
+	w.buf.Reset()
+	w.sender(w.conn, w.requestID, data)
+}
+
+// handleRPCStreamCall 流式调用:每次 handler Flush 触发 rpc_stream_data,handler 返回后发 rpc_reply。
+// timeout 来自 master payload — 5 分钟够大部分场景。
+func (c *Client) handleRPCStreamCall(conn *websocket.Conn, p WSRPCCallPayload) {
+	reply := WSRPCReplyPayload{RequestID: p.RequestID}
+
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[Agent] rpc_stream_call handler panic: %v (path=%s)", r, p.Path)
+			reply.Status = http.StatusInternalServerError
+			reply.Error = "agent handler panic"
+		}
+		c.sendRPCReply(conn, reply)
+	}()
+
+	if c.rpcMux == nil {
+		reply.Status = http.StatusServiceUnavailable
+		reply.Error = "agent rpc mux not initialized"
+		return
+	}
+
+	u := &url.URL{Path: p.Path, RawQuery: p.Query}
+	req, err := http.NewRequest(p.Method, u.String(), bytes.NewReader([]byte(p.Body)))
+	if err != nil {
+		reply.Status = http.StatusBadRequest
+		reply.Error = "construct request: " + err.Error()
+		return
+	}
+	req.Header.Set("X-WS-RPC", "1")
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "ws-rpc"
+
+	sw := newStreamingResponseWriter(conn, p.RequestID, c.sendRPCStreamData)
+
+	timeout := time.Duration(p.TimeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	done := make(chan struct{})
+	go func() {
+		c.rpcMux.ServeHTTP(sw, req)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// handler 正常返回,把残留 buf 收尾 flush 一次
+		sw.Flush()
+		reply.Status = sw.status
+	case <-time.After(timeout):
+		log.Printf("[Agent] rpc_stream_call timeout (%v) path=%s", timeout, p.Path)
+		reply.Status = http.StatusGatewayTimeout
+		reply.Error = "agent handler timeout"
+		// 不调 sw.Flush() — 已经写过的帧 master 已收到,reply 告知超时即可
+	}
+}
+
+// sendRPCStreamData 单帧 rpc_stream_data。WS 已断 → 静默丢弃(master 会通过 reply timeout 感知)。
+func (c *Client) sendRPCStreamData(conn *websocket.Conn, reqID string, data []byte) {
+	msg := map[string]any{
+		"type": WSMsgTypeRPCStreamData,
+		"payload": WSRPCStreamDataPayload{
+			RequestID: reqID,
+			Data:      string(data),
+		},
+	}
+	if err := c.writeEncrypted(conn, msg); err != nil {
+		log.Printf("[Agent] send rpc_stream_data failed (request_id=%s): %v", reqID, err)
 	}
 }
