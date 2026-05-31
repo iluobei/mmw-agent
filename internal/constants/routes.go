@@ -14,6 +14,7 @@ const (
 	PathChildXrayConfig   = "/api/child/xray/config"
 	PathChildXraySysCfg   = "/api/child/xray/system-config"
 	PathChildXrayCfgFiles = "/api/child/xray/config-files"
+	PathChildXrayTestCfg  = "/api/child/xray/test-config"
 	PathChildNginxInstall = "/api/child/nginx/install"
 	PathChildNginxRemove  = "/api/child/nginx/remove"
 	PathChildNginxConfig  = "/api/child/nginx/config"

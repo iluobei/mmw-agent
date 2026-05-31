@@ -20,6 +20,7 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildXrayConfig, manageHandler.HandleXrayConfig)
 	mux.HandleFunc(constants.PathChildXraySysCfg, manageHandler.HandleXraySystemConfig)
 	mux.HandleFunc(constants.PathChildXrayCfgFiles, manageHandler.HandleXrayConfigFiles)
+	mux.HandleFunc(constants.PathChildXrayTestCfg, manageHandler.HandleXrayTestConfig)
 	mux.HandleFunc(constants.PathChildNginxInstall, manageHandler.HandleNginxInstall)
 	mux.HandleFunc(constants.PathChildNginxRemove, manageHandler.HandleNginxRemove)
 	mux.HandleFunc(constants.PathChildNginxConfig, manageHandler.HandleNginxConfig)

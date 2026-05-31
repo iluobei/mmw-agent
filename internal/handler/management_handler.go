@@ -668,8 +668,16 @@ func (h *ManageHandler) getXrayConfig(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// config 文件不存在时不再 404 —— 主控前端打开 Xray 配置 dialog 需要一个总能成功的入口,
+	// 即便 xray 没装 / 配置被删,也应该让用户能在空 textarea 里粘贴 / 编辑配置后下发。
+	// 返回空 config + 默认 path(后续 setXrayConfig 写盘也用这个 path)。
 	if configPath == "" {
-		writeError(w, http.StatusNotFound, "Xray config not found")
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success":  true,
+			"path":     constants.DefaultXrayConfigPaths[0],
+			"config":   "",
+			"is_empty": true,
+		})
 		return
 	}
 
@@ -684,6 +692,9 @@ func (h *ManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Config string `json:"config"`
 		Path   string `json:"path,omitempty"`
+		// Force=true 跳过 xray test 验证(默认必测)。
+		// 通常仅用于本地调试 / 主控判定配置确实有效需强制下发的边界场景。
+		Force bool `json:"force,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -721,6 +732,22 @@ func (h *ManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
+	// 写盘前用 xray test 验证(默认必测)— 阻止坏配置写入磁盘后引发 xray 启动失败 → 用户被迫 SSH 救援。
+	// 外置 + 系统装了 xray 优先用命令(认 fork 字段);否则用 xray-core 库(基于 LoadJSONConfig)。
+	if !req.Force {
+		if testErr, output, method := runXrayTest(r.Context(), h.xrayMode, rawConfig); testErr != nil {
+			log.Printf("[Manage] setXrayConfig refused write: xray test failed (%s): %v\n%s", method, testErr, output)
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("xray config test failed: %v", testErr),
+				"output":  output,
+				"method":  method,
+			})
+			return
+		}
+	}
+
 	if err := os.WriteFile(configPath, rawConfig, 0644); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to write config: %v", err))
 		return
@@ -733,6 +760,72 @@ func (h *ManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Request) {
 		"message": "Config saved successfully",
 		"path":    configPath,
 	})
+}
+
+// runXrayTest 验证一份 xray config 是否合法,返回 (err, output, method)。
+// 测试不绑定端口,不和当前 running 的 xray 实例冲突。
+//
+// 分模式策略:
+//   - mode != "embedded" + 系统装了 xray → exec `xray run -test -config <tmpfile>`(认 fork 字段、完整 -test 语义)
+//   - 否则(embedded / external 但 PATH 无 xray) → embedded.TestConfigJSON(库调用 confserial.LoadJSONConfig)
+//
+// method 取值 "xray-cli" / "xray-library" — 前端可据此显示验证手段。
+func runXrayTest(ctx context.Context, xrayMode string, rawConfig []byte) (err error, output, method string) {
+	if xrayMode != "embedded" {
+		if p, lookErr := exec.LookPath("xray"); lookErr == nil {
+			tmpfile, terr := os.CreateTemp("", "xray-test-*.json")
+			if terr == nil {
+				_, _ = tmpfile.Write(rawConfig)
+				_ = tmpfile.Close()
+				defer os.Remove(tmpfile.Name())
+
+				tctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+				defer cancel()
+				out, cerr := exec.CommandContext(tctx, p, "run", "-test", "-config", tmpfile.Name()).CombinedOutput()
+				return cerr, strings.TrimSpace(string(out)), "xray-cli"
+			}
+		}
+	}
+	if lerr := embedded.TestConfigJSON(rawConfig); lerr != nil {
+		return lerr, "", "xray-library"
+	}
+	return nil, "", "xray-library"
+}
+
+// HandleXrayTestConfig 接收一份完整 xray config(JSON 文本),验证合法性,返回 {ok, error, output, method}。
+// 主控的 Xray 配置 dialog "保存"前会调一次本接口,失败则拒绝下发,从源头杜绝写入坏 config 引发 xray 启动失败。
+func (h *ManageHandler) HandleXrayTestConfig(w http.ResponseWriter, r *http.Request) {
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	var req struct {
+		Config string `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if strings.TrimSpace(req.Config) == "" {
+		writeError(w, http.StatusBadRequest, "config is empty")
+		return
+	}
+
+	testErr, output, method := runXrayTest(r.Context(), h.xrayMode, []byte(req.Config))
+	resp := map[string]interface{}{
+		"ok":     testErr == nil,
+		"output": output,
+		"method": method,
+	}
+	if testErr != nil {
+		resp["error"] = testErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ================== Xray 系统配置 ==================

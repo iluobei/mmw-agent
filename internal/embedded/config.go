@@ -16,6 +16,17 @@ import (
 	mydispatcher "mmw-agent/internal/dispatcher"
 )
 
+// TestConfigJSON 用 xray-core 库语义验证一份 JSON 配置:
+//   - 解析失败 → 返回 error,内容包含 xray-core 抛出的字段路径/类型错误
+//   - 解析成功 → 返回 nil
+//
+// 不会绑定端口、不会和正在运行的内嵌 xray instance 冲突 — 只走 conf parsing。
+// 实现等价 xray 二进制的 -test flag 内部所做的事(LoadConfig,不 Build instance)。
+func TestConfigJSON(jsonData []byte) error {
+	_, err := confserial.LoadJSONConfig(bytes.NewReader(jsonData))
+	return err
+}
+
 func buildCoreConfig(configPath string) (*core.Config, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
