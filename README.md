@@ -5,6 +5,9 @@
 <details>
 <summary>更新日志</summary>
 
+### v0.2.3 (2026-05-31)
+- 🛠️ fix:xray test 缺失 geodata失败
+
 ### v0.2.2 (2026-05-31)
 - 🌈调整内联模式管理Xray流程
 
