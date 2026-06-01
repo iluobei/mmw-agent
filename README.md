@@ -5,6 +5,9 @@
 <details>
 <summary>更新日志</summary>
 
+### v0.2.4 (2026-06-01)
+- 🛠️ fix:xray 补丁对路由出站不生效
+
 ### v0.2.3 (2026-05-31)
 - 🛠️ fix:xray test 缺失 geodata失败
 
