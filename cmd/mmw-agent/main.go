@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -293,7 +294,7 @@ func ensureGeoData() {
 	dir := filepath.Dir(exePath)
 
 	files := map[string]string{
-		"geoip.dat":  "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
+		"geoip.dat":   "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
 		"geosite.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
 	}
 
@@ -602,12 +603,16 @@ func mergeRouting(existingRaw, templateRaw any) any {
 	templateRules, _ := template["rules"].([]any)
 
 	tplMarktags := make(map[string]bool)
+	tplSignatures := make(map[string]bool)
 	for _, r := range templateRules {
 		if obj, ok := r.(map[string]any); ok {
 			if m, _ := obj["marktag"].(string); m != "" {
 				tplMarktags[m] = true
 			}
 		}
+		// 内容签名:防止 template 的"无 marktag"基础 rule(tunnel-in→direct / api→api /
+		// geoip:private→block 等)每次 agent 重启 + mergeXrayConfig 都被作为"existing 独有"重新追加。
+		tplSignatures[routingRuleSignature(r)] = true
 	}
 
 	rules := make([]any, 0, len(templateRules)+len(existingRules))
@@ -621,8 +626,40 @@ func mergeRouting(existingRaw, templateRaw any) any {
 		if m, _ := obj["marktag"].(string); m != "" && tplMarktags[m] {
 			continue
 		}
+		if tplSignatures[routingRuleSignature(r)] {
+			continue
+		}
 		rules = append(rules, r)
 	}
 	merged["rules"] = rules
 	return merged
+}
+
+// routingRuleSignature 把一条 routing rule 关键字段规范化为字符串签名,用于 mergeRouting 内容去重。
+// 集合字段(inboundTag / ip / domain / user / protocol / network)排序后拼接,保证同语义不同顺序也算同一条。
+func routingRuleSignature(r any) string {
+	obj, _ := r.(map[string]any)
+	if obj == nil {
+		return ""
+	}
+	keys := []string{"type", "outboundTag", "balancerTag", "inboundTag", "ip", "domain", "user", "protocol", "network", "source", "port", "sourcePort", "marktag"}
+	var parts []string
+	for _, k := range keys {
+		v, ok := obj[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch vv := v.(type) {
+		case []any:
+			strs := make([]string, 0, len(vv))
+			for _, x := range vv {
+				strs = append(strs, fmt.Sprint(x))
+			}
+			sort.Strings(strs)
+			parts = append(parts, k+":["+strings.Join(strs, ",")+"]")
+		default:
+			parts = append(parts, k+":"+fmt.Sprint(v))
+		}
+	}
+	return strings.Join(parts, "|")
 }
