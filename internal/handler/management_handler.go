@@ -2565,6 +2565,10 @@ func matchClientCredential(a, b map[string]interface{}, protocol string) bool {
 		}
 		return av == bv
 	}
+	hasNonEmpty := func(m map[string]interface{}, k string) bool {
+		v := fmt.Sprint(m[k])
+		return v != "" && v != "<nil>"
+	}
 	var primaryKey string
 	switch strings.ToLower(protocol) {
 	case "vless", "vmess":
@@ -2576,9 +2580,15 @@ func matchClientCredential(a, b map[string]interface{}, protocol string) bool {
 	case "socks", "http":
 		primaryKey = "user"
 	}
-	if primaryKey != "" && bothNonEmptyEq(primaryKey) {
-		return true
+	// 双方都带 primary key(完整凭据) → 只看 primary key,**不** fallback email。
+	// 同一 inbound 上多 client 共享 email 是合法场景(per-user 套餐绑定多客户端),
+	// 老版本 email fallback 在这里会把 id 不同但 email 同的两个 client 误判为同一个,
+	// add-client 时直接 no-op,新加的 client 永远进不去。
+	if primaryKey != "" && hasNonEmpty(a, primaryKey) && hasNonEmpty(b, primaryKey) {
+		return bothNonEmptyEq(primaryKey)
 	}
+	// 任一方缺 primary key — 典型是主控 removeClientFromInbound 只传 {email: ...}
+	// 这种"按 email 删 client"路径需要保留,降级用 email 匹配。
 	return bothNonEmptyEq("email")
 }
 
