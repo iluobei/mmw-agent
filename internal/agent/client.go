@@ -97,8 +97,12 @@ type Client struct {
 	httpSession   *securechan.Session
 	httpSessionMu sync.Mutex
 
-	// 公网 IPv4 缓存
+	// 公网 IPv4 缓存(也可能装 v6,见 detectPublicIPv4 注释)
 	publicIPv4 string
+
+	// dual-stack v6 缓存:独立于 publicIPv4 的 v6-only 探测结果,
+	// 心跳和 auth 时上报,供 master 反向 HTTP 在 v4 失败时 fallback。
+	publicIPv6 string
 
 	// 反向 RPC 路由表 — 跟普通 HTTP mux 共享同一份 /api/child/* handler 实例,
 	// 区别仅在请求是从 WS 帧解出来构造的 *http.Request,而不是从 net.Listener 收来的。
@@ -399,6 +403,10 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	if c.publicIPv4 == "" {
 		c.publicIPv4 = c.detectPublicIPv4()
 	}
+	// publicIPv6 独立探测(detectPublicIPv6 仅返回 v6 字符串)— dual-stack 服务器才有非空值
+	if c.publicIPv6 == "" {
+		c.publicIPv6 = c.detectPublicIPv6()
+	}
 	// capabilities.rpc = true 告诉 master 本 agent 能接 WSMsgTypeRPCCall,master 可以把
 	// 原本走 HTTP /api/child/* 的反向调用切到 WS,绕开 IPv6 漂移 / NAT 反向不通的痛点。
 	// capabilities.stream = true 告诉 master 本 agent 还能跑 rpc_call(Stream:true) → rpc_stream_data
@@ -407,6 +415,7 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 	authPayload, _ := json.Marshal(map[string]any{
 		"token":       c.config.Token,
 		"public_ipv4": c.publicIPv4,
+		"public_ipv6": c.publicIPv6,
 		"capabilities": map[string]bool{
 			"rpc":    rpcAvailable,
 			"stream": rpcAvailable,
@@ -669,12 +678,16 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 	if c.publicIPv4 == "" {
 		c.publicIPv4 = c.detectPublicIPv4()
 	}
+	if c.publicIPv6 == "" {
+		c.publicIPv6 = c.detectPublicIPv6()
+	}
 	listenPort, _ := strconv.Atoi(c.config.ListenPort)
-	payload, _ := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]any{
 		"boot_time":   c.startTime,
 		"listen_port": listenPort,
 		"local_time":  time.Now().Unix(),
 		"public_ipv4": c.publicIPv4,
+		"public_ipv6": c.publicIPv6,
 	})
 
 	msg := map[string]interface{}{
@@ -766,6 +779,49 @@ func (c *Client) detectPublicIPv4() string {
 		"https://ipv6.icanhazip.com",
 		"https://v6.ident.me",
 	}, false)
+}
+
+// detectPublicIPv6 仅探测公网 IPv6。dual-stack 服务器才会拿到非空,IPv4-only 返回空。
+// 与 detectPublicIPv4 不同:这里强制 tcp6 + want6=true 校验,只接受 v6 字符串。
+// 用途:auth/heartbeat 上报给 master,让 master HTTP 反向请求在 v4 失败时 fallback 试 v6。
+func (c *Client) detectPublicIPv6() string {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp6", addr)
+			},
+			TLSHandshakeTimeout: 5 * time.Second,
+		},
+	}
+	for _, u := range []string{
+		"https://6.ipw.cn",
+		"https://api6.ipify.org",
+		"https://ipv6.icanhazip.com",
+		"https://v6.ident.me",
+	} {
+		resp, err := client.Get(u)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		ip := strings.TrimSpace(string(body))
+		parsed := net.ParseIP(ip)
+		if parsed == nil {
+			continue
+		}
+		// 严格校验:必须是 v6(.To4() == nil 等同于 v6 literal)
+		if parsed.To4() != nil {
+			continue
+		}
+		return ip
+	}
+	return ""
 }
 
 // SetEmbeddedXray 设置嵌入模式的 Xray 实例。
