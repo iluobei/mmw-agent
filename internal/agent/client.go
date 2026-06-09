@@ -206,10 +206,19 @@ func NewClient(cfg *config.Config) *Client {
 		xrayServers: cfg.XrayServers,
 		stopCh:      make(chan struct{}),
 		startTime:   time.Now(),
-		httpClient: &http.Client{
-			Timeout: constants.DefaultHTTPClientTimeout,
-		},
 		currentMode: ModePull,
+	}
+	// httpClient 用跟 WS 同款的 v4 优先 dialer — 否则 Go 默认 dialer 在 dual-stack 主机上
+	// Happy Eyeballs 偏好 v6,HTTP heartbeat 全程走 v6 → master 看 RemoteAddr 是 v6 →
+	// db.ip_address 误写 v6 → IPv4-only master 反向请求 502。
+	c.httpClient = &http.Client{
+		Timeout: constants.DefaultHTTPClientTimeout,
+		Transport: &http.Transport{
+			DialContext:           c.preferV4DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       90 * time.Second,
+		},
 	}
 	if cfg.MasterPublicKey != "" {
 		if pub, err := securechan.ParsePublicKey(cfg.MasterPublicKey); err == nil {
@@ -424,7 +433,7 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 	// 全 502。优先 v4 解决 dual-stack 主机的偏好问题,失败 v6 兜底保住纯 v6 服务器。
 	dialer := websocket.Dialer{
 		HandshakeTimeout: constants.WebSocketHandshakeTimeout,
-		NetDialContext:   preferV4DialContext,
+		NetDialContext:   c.preferV4DialContext,
 	}
 
 	conn, _, err := dialer.DialContext(ctx, u.String(), c.wsHeaders())
@@ -789,22 +798,34 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 	return c.writeEncrypted(conn, msg)
 }
 
-// preferV4DialContext 是 v4 优先 v6 兜底的 dialer。给 WS 拨号用 — getaddrinfo
-// 默认在 dual-stack 主机上优先 IPv6,导致 WS 源 IP 是 v6,master 兜底也存 v6 → IPv4-only
-// 主控反向 HTTP 请求 agent 全部 502。
+// preferV4DialContext 是 v4 优先 v6 兜底的 dialer。给 WS / HTTP 拨号 master 用。
+// 默认 net.Dialer 在 dual-stack 主机上优先 IPv6(getaddrinfo+Happy Eyeballs),导致连接源 IP
+// 是 v6,master 写 db 也是 v6 → IPv4-only 主控反向 HTTP 请求 agent 全部 502。
 //
-// 时序:tcp4 留 3s 拨号窗口 —
-//   - 没有 v4 路由 / DNS 无 A 记录:syscall 立刻返回 ENETUNREACH(<10ms),
-//     不会拖累 IPv6-only 服务器
-//   - v4 通但慢:3s 内大部分网络环境都能连上
-//   - v4 真的废了:3s 后超时 → 走 v6 兜底,总耗时 ≤ 3+5=8s
-// tcp6 给完整 5s,避免双重缩短在弱网下都失败。
-func preferV4DialContext(ctx context.Context, _, addr string) (net.Conn, error) {
-	v4 := &net.Dialer{Timeout: 3 * time.Second}
+// 行为分两档,由后台 ipProbeLoop 拿到的 publicIPv4 缓存决定:
+//
+//  1. ipProbeLoop 已确认本机 v4 出口可用(`getPublicIPv4() != ""`):
+//     **严格 tcp4**,不 fallback v6。本机 v4 都通了,master 极大概率也接得到 v4 入站;
+//     这一档把 v4 timeout 拉到 10s,让弱网 / 跨地域 TLS 握手有充裕窗口,避免被边缘 timeout
+//     踹去走 v6,造成"v4 实际通但偶发慢一点就降级 v6 长锁"的现网症状。
+//
+//  2. v4 尚未探到(`getPublicIPv4() == ""`):
+//     按老逻辑 tcp4 10s 优先,失败 tcp6 6s 兜底 — 兼顾刚启动还没 probe 完的窗口期,
+//     和真正 IPv6-only 的 agent 服务器。
+//
+// 改成 method 是为了能读 c.getPublicIPv4();httpClient 的 Transport 也用这个函数 →
+// 所有出向连接(WS + HTTP heartbeat + traffic + speed)统一行为,不再有"WS 走偏好但 HTTP
+// 走 Go 默认 Happy Eyeballs"的口子。
+func (c *Client) preferV4DialContext(ctx context.Context, _, addr string) (net.Conn, error) {
+	v4 := &net.Dialer{Timeout: 10 * time.Second}
+	if c.getPublicIPv4() != "" {
+		// 已经知道本机 v4 出口通 → 严格 v4,不再 fallback v6
+		return v4.DialContext(ctx, "tcp4", addr)
+	}
 	if conn, err := v4.DialContext(ctx, "tcp4", addr); err == nil {
 		return conn, nil
 	}
-	v6 := &net.Dialer{Timeout: 5 * time.Second}
+	v6 := &net.Dialer{Timeout: 6 * time.Second}
 	return v6.DialContext(ctx, "tcp6", addr)
 }
 
@@ -829,7 +850,6 @@ func (c *Client) detectPublicIPv4() string {
 		},
 	}
 	urls := []string{
-		"https://4.ipw.cn",
 		"https://api4.ipify.org",
 		"https://ipv4.icanhazip.com",
 		"https://v4.ident.me",
@@ -1051,7 +1071,7 @@ func (c *Client) tryWebSocketOnce(ctx context.Context) error {
 	// 同 connectAndRun:探测拨号也走 v4 优先 v6 兜底,保持探测和正式连接同一选择
 	dialer := websocket.Dialer{
 		HandshakeTimeout: constants.WebSocketHandshakeTimeout,
-		NetDialContext:   preferV4DialContext,
+		NetDialContext:   c.preferV4DialContext,
 	}
 
 	conn, _, err := dialer.DialContext(ctx, u.String(), c.wsHeaders())
@@ -1225,10 +1245,16 @@ func (c *Client) sendSpeedHTTP(ctx context.Context) error {
 // 通过 HTTP POST 发送心跳。
 func (c *Client) sendHeartbeatHTTP(ctx context.Context) error {
 	listenPort, _ := strconv.Atoi(c.config.ListenPort)
+	// HTTP 模式下 master 看到的 RemoteAddr 可能是 v6(agent 用 v6 拨号 / CDN 入站 v6),
+	// 若不上报 public_ipv4,master 只能用 RemoteAddr → 把 v6 错写进 db.ip_address 字段 →
+	// IPv4-only master 反向请求全部 502。这里跟 WS auth/heartbeat 同款,把后台 ipProbeLoop
+	// 缓存的 v4/v6 一起上报,master 端优先用,fallback 才用 RemoteAddr 并强校验类型。
 	payload, _ := json.Marshal(map[string]interface{}{
 		"boot_time":   c.startTime.Unix(),
 		"listen_port": listenPort,
 		"local_time":  time.Now().Unix(),
+		"public_ipv4": c.getPublicIPv4(),
+		"public_ipv6": c.getPublicIPv6(),
 	})
 
 	u, err := url.Parse(c.config.MasterURL)
@@ -1401,21 +1427,39 @@ func (c *Client) runPullModeWithTrafficReport(ctx context.Context, duration time
 	}
 }
 
-// 在等待期间继续上报流量。
+// 在等待期间继续上报流量 / 心跳 / 速率 — WS 模式 reconnect 退避期间的 HTTP 全降级。
+//
+// 设计:WS 不可用时所有上报接口都降级 HTTP,而不仅 traffic。原版只跑 traffic 导致:
+//   - sendHeartbeatHTTP 不发 → master 拿不到 agent 上报的 public_ipv4/v6 → db.ip_address
+//     被旧值卡住(或被 WS handleAuth 的历史 srcIP 卡住,见 173.249.198.102 现网症状)
+//   - sendSpeedHTTP 不发 → master 端 current_upload_speed / current_download_speed 停滞
+//
+// 阈值保护:duration <= PullModeTrafficReportThreshold 时跳过入口立即跑那一发,
+// 避免短 backoff 期间 spam(ticker 仍按各自周期 fire,这是冷启动后正常节奏)。
 func (c *Client) waitWithTrafficReport(ctx context.Context, duration time.Duration) {
 	if duration <= 0 {
 		return
 	}
 
 	if duration > constants.PullModeTrafficReportThreshold {
+		if err := c.sendHeartbeatHTTP(ctx); err != nil {
+			log.Printf("[Agent] Heartbeat report during backoff failed: %v", err)
+		}
 		if err := c.sendTrafficHTTP(ctx); err != nil {
 			log.Printf("[Agent] Traffic report during backoff failed: %v", err)
+		}
+		if err := c.sendSpeedHTTP(ctx); err != nil {
+			log.Printf("[Agent] Speed report during backoff failed: %v", err)
 		}
 	}
 
 	trafficTicker := time.NewTicker(c.config.TrafficReportInterval)
 	defer c.registerTrafficTicker(trafficTicker)() // master push config_update 时 Reset 该 ticker
 	defer trafficTicker.Stop()
+	speedTicker := time.NewTicker(c.config.SpeedReportInterval)
+	defer speedTicker.Stop()
+	heartbeatTicker := time.NewTicker(constants.WebSocketHeartbeatInterval)
+	defer heartbeatTicker.Stop()
 
 	timeout := time.After(duration)
 
@@ -1430,6 +1474,14 @@ func (c *Client) waitWithTrafficReport(ctx context.Context, duration time.Durati
 		case <-trafficTicker.C:
 			if err := c.sendTrafficHTTP(ctx); err != nil {
 				log.Printf("[Agent] Traffic report during backoff failed: %v", err)
+			}
+		case <-speedTicker.C:
+			if err := c.sendSpeedHTTP(ctx); err != nil {
+				log.Printf("[Agent] Speed report during backoff failed: %v", err)
+			}
+		case <-heartbeatTicker.C:
+			if err := c.sendHeartbeatHTTP(ctx); err != nil {
+				log.Printf("[Agent] Heartbeat report during backoff failed: %v", err)
 			}
 		}
 	}
