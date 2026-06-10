@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"syscall"
 	"path/filepath"
 	"strings"
@@ -4324,10 +4325,18 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
 
-	confDir := constants.NginxPrimaryPrefixDir
-	if _, err := os.Stat(confDir); err != nil {
-		confDir = constants.NginxConfigDirPaths[0]
+	// confDir 选择:优先用 nginx -V 拿编译路径(权威),不用就 fallback stat(老逻辑兼容)。
+	// 老逻辑的 bug:install-nginx.sh 异步装时,stat 容易在 5s deploy 窗口里返回"不存在" →
+	// 写到 /etc/nginx → nginx 装完后实际 conf-path 是 /usr/local/nginx/nginx.conf → 读不到。
+	confDir := detectNginxConfDirFromBinary()
+	confDirAuthoritative := confDir != "" // detect 出的 conf-path 100% 可信,跟 nginx 跑时一致
+	if confDir == "" {
+		confDir = constants.NginxPrimaryPrefixDir
+		if _, err := os.Stat(confDir); err != nil {
+			confDir = constants.NginxConfigDirPaths[0]
+		}
 	}
+	log.Printf("[Manage] setup-ssl confDir=%s authoritative=%v (domain=%s)", confDir, confDirAuthoritative, domain)
 
 	// 确保证书和 servers 目录存在
 	os.MkdirAll(filepath.Join(confDir, "cert"), 0755)
@@ -4359,9 +4368,15 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 		deployNginxSSLConfig(domain)
 	}
 
-	// 重载 nginx 使配置生效
+	// 重载 nginx 使配置生效。reload 失败 + confDir 是猜的(不 authoritative) → 大概率写错位置,
+	// 必须让主控知道(返 500),避免老 bug:写到 /etc/nginx 但 nginx 跑 /usr/local/nginx,reload OK 200 假成功。
+	// reload 失败 + confDir 权威 → 配置位置 OK,失败大概率是语法 / 权限,仍 200(用户/主控可后续手动 reload)。
 	if err := reloadNginx(); err != nil {
-		log.Printf("[Manage] Nginx reload after setup-ssl failed: %v", err)
+		log.Printf("[Manage] Nginx reload after setup-ssl failed (confDir=%s authoritative=%v): %v", confDir, confDirAuthoritative, err)
+		if !confDirAuthoritative {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("nginx reload failed and confDir was guessed (%s); please ensure nginx is installed then retry: %v", confDir, err))
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -4423,6 +4438,40 @@ func (h *ManageHandler) HandleValidateSite(w http.ResponseWriter, r *http.Reques
 	default:
 		writeError(w, http.StatusBadRequest, "site_type must be 'static' or 'proxy'")
 	}
+}
+
+// detectNginxConfDirFromBinary 用 `nginx -V` 拿到编译时的 conf-path,返回它的父目录。
+//
+// 解决的 race:`stealSelfDeployer` 在 agent 上线后 5s 触发 setup-ssl,但 install-nginx.sh 是异步跑,
+// 5s 内 `/usr/local/nginx/` 可能还没建好 → 老逻辑 `os.Stat` 失败 → fallback 到 `/etc/nginx/` → 配置
+// 写到那里,但 nginx 装完后实际跑的是 `/usr/local/nginx/nginx.conf`(编译路径) → 根本读不到 → 用户
+// 永远看不到 ssl 配置生效。
+//
+// 用 nginx -V 才能拿到权威的 conf-path,不再依赖目录是否存在的快照式判断。
+// 找不到二进制 / 解析失败 → 返回空串,调用方走原 stat fallback(老 agent 兼容)。
+func detectNginxConfDirFromBinary() string {
+	var bin string
+	for _, p := range constants.NginxBinarySearchPaths {
+		if path, err := exec.LookPath(p); err == nil {
+			bin = path
+			break
+		}
+	}
+	if bin == "" {
+		return ""
+	}
+	// nginx -V 把信息打到 stderr。CombinedOutput 一并捕获,简单粗暴
+	out, err := exec.Command(bin, "-V").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	// 输出形如 `--conf-path=/usr/local/nginx/nginx.conf`,取出 dir 部分
+	re := regexp.MustCompile(`--conf-path=(\S+)/nginx\.conf`)
+	m := re.FindStringSubmatch(string(out))
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
 }
 
 func reloadNginx() error {
