@@ -103,6 +103,12 @@ type Client struct {
 	publicIPv4 string
 	publicIPv6 string
 
+	// 重连唤醒信号:IP 漂移 / 外部主动触发时,正在退避 backoff 的
+	// waitWithTrafficReport / runPullModeWithTrafficReport 立即退出,
+	// 让上层重新尝试 WS 连接 — 避免换 IP 后还呆在 5 分钟退避里。
+	// buffered=1,triggerReconnect 用 non-blocking send,信号有就有,丢了也无所谓。
+	reconnectSignal chan struct{}
+
 	// 反向 RPC 路由表 — 跟普通 HTTP mux 共享同一份 /api/child/* handler 实例,
 	// 区别仅在请求是从 WS 帧解出来构造的 *http.Request,而不是从 net.Listener 收来的。
 	// nil = 主程序未注入 → handleRPCCall 直接报 503 错回 master,master 自动 fallback HTTP。
@@ -154,38 +160,48 @@ func (c *Client) ipProbeLoop(ctx context.Context) {
 		curV4, curV6 := c.publicIPv4, c.publicIPv6
 		c.ipMu.RUnlock()
 
-		newV4 := curV4
-		newV6 := curV6
+		// 每次都重新 detect — 注释里说的"5min 轮询兜底 IP 漂移"必须真的做漂移检测,
+		// 否则缓存一旦写上就永远不变,换 IP 后心跳上报的 public_ipv4 还是老值,
+		// master 入库老 IP → 反向请求全失败 → master 看不到 agent 上线。
+		// detect 失败(返回空)时保留旧值,避免临时探测失败把缓存清空。
+		newV4 := c.detectPublicIPv4()
 		if newV4 == "" {
-			if v := c.detectPublicIPv4(); v != "" {
-				newV4 = v
-				log.Printf("[Agent] Public IPv4 detected: %s", v)
-			}
+			newV4 = curV4
 		}
+		newV6 := c.detectPublicIPv6()
 		if newV6 == "" {
-			if v := c.detectPublicIPv6(); v != "" {
-				newV6 = v
-				log.Printf("[Agent] Public IPv6 detected: %s", v)
-			}
+			newV6 = curV6
 		}
-		if newV4 != curV4 || newV6 != curV6 {
+
+		v4Changed := newV4 != curV4
+		v6Changed := newV6 != curV6
+		if v4Changed || v6Changed {
 			c.ipMu.Lock()
 			c.publicIPv4 = newV4
 			c.publicIPv6 = newV6
 			c.ipMu.Unlock()
+			if v4Changed {
+				log.Printf("[Agent] Public IPv4 changed: %q -> %q", curV4, newV4)
+			}
+			if v6Changed {
+				log.Printf("[Agent] Public IPv6 changed: %q -> %q", curV6, newV6)
+			}
+			// IP 变化 → 立刻唤醒 backoff,让 agent 用新 IP 重连(避免换 IP 后还在 5 分钟退避里睡)。
+			// 首次探到 v4 也走这条 — curV4="" → newV4!="" 是 changed,正好让冷启动 backoff 也加速。
+			c.triggerReconnect()
 		}
 	}
 
 	// 启动后立即 detect 一次,让首次心跳有更高概率带上 v4
 	probeOnce()
 
-	// 重试节奏:v4 还没拿到 → 30s 重试;已拿到 → 5min 轮询(出口 IP 漂移兜底)
+	// 重试节奏:v4 还没拿到 → 30s 重试;已拿到 → 1min 轮询(原来 5min,换 IP 场景反应太慢)
 	for {
 		c.ipMu.RLock()
 		needV4 := c.publicIPv4 == ""
 		c.ipMu.RUnlock()
 
-		delay := 5 * time.Minute
+		delay := 1 * time.Minute
 		if needV4 {
 			delay = 30 * time.Second
 		}
@@ -201,12 +217,13 @@ func (c *Client) ipProbeLoop(ctx context.Context) {
 // 创建 agent 客户端。
 func NewClient(cfg *config.Config) *Client {
 	c := &Client{
-		config:      cfg,
-		collector:   collector.NewCollector(),
-		xrayServers: cfg.XrayServers,
-		stopCh:      make(chan struct{}),
-		startTime:   time.Now(),
-		currentMode: ModePull,
+		config:          cfg,
+		collector:       collector.NewCollector(),
+		xrayServers:     cfg.XrayServers,
+		stopCh:          make(chan struct{}),
+		startTime:       time.Now(),
+		currentMode:     ModePull,
+		reconnectSignal: make(chan struct{}, 1),
 	}
 	// httpClient 用跟 WS 同款的 v4 优先 dialer — 否则 Go 默认 dialer 在 dual-stack 主机上
 	// Happy Eyeballs 偏好 v6,HTTP heartbeat 全程走 v6 → master 看 RemoteAddr 是 v6 →
@@ -291,18 +308,48 @@ func (c *Client) Start(ctx context.Context) {
 	}
 }
 
+// triggerReconnect 唤醒正在 backoff 退避里睡的 goroutine 立刻重连。
+// non-blocking:信道满了说明已有挂起信号,丢这次也行。
+//
+// 顺手把 reconnects 清零:这是"外部触发的重连机会"(典型 IP 漂移),
+// 不应该被旧的累积失败 backoff(可能已经到 5 分钟上限)拖累 — 新 IP 网络条件
+// 是全新的,即使第一次失败也应该从最短 backoff (5s) 重新开始而不是 300s。
+func (c *Client) triggerReconnect() {
+	c.reconnects = 0
+	select {
+	case c.reconnectSignal <- struct{}{}:
+	default:
+	}
+}
+
 // 停止客户端。
+//
+// 关键顺序:**先关 wsConn**,让所有正在 ReadMessage/WriteMessage 阻塞的 goroutine
+// 立刻返回 error → 它们的 outer loop 看见 ctx 已 cancel → return → wg.Done。
+// 否则 WriteMessage 没 WriteDeadline 时会卡到 TCP retransmission(~15 分钟),
+// wg.Wait 永远等不到,systemctl restart 在用户视角就是"假死"。
+// 即便如此,wg.Wait 仍用 AgentStopTimeout 兜底 — 任何意外卡死也不让 systemd 等到 90s TimeoutStopSec。
 func (c *Client) Stop() {
 	close(c.stopCh)
-	c.wg.Wait()
 
 	c.wsMu.Lock()
 	if c.wsConn != nil {
 		c.wsConn.Close()
+		c.wsConn = nil
 	}
 	c.wsMu.Unlock()
 
-	log.Printf("[Agent] Stopped")
+	done := make(chan struct{})
+	go func() {
+		c.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Printf("[Agent] Stopped")
+	case <-time.After(constants.AgentStopTimeout):
+		log.Printf("[Agent] Stop timed out after %s, exiting with leaked goroutines", constants.AgentStopTimeout)
+	}
 }
 
 // 返回 WebSocket 连接状态。
@@ -569,6 +616,7 @@ func (c *Client) performKeyExchange(conn *websocket.Conn) (*securechan.Session, 
 		"type":    "key_exchange",
 		"payload": json.RawMessage(kxPayload),
 	}
+	_ = conn.SetWriteDeadline(time.Now().Add(constants.WebSocketWriteDeadline))
 	if err := conn.WriteJSON(msg); err != nil {
 		return nil, err
 	}
@@ -631,12 +679,16 @@ func (c *Client) writeEncrypted(conn *websocket.Conn, msg interface{}) error {
 			return err
 		}
 		c.wsMu.Lock()
+		// SetWriteDeadline 必须设 — 没设这一行,TCP send buffer 满时
+		// WriteMessage 会卡到 TCP retransmission(~15min) → 拖死 runMessageLoop。
+		_ = conn.SetWriteDeadline(time.Now().Add(constants.WebSocketWriteDeadline))
 		err = conn.WriteMessage(websocket.BinaryMessage, envelope)
 		c.wsMu.Unlock()
 		return err
 	}
 
 	c.wsMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(constants.WebSocketWriteDeadline))
 	err = conn.WriteMessage(websocket.TextMessage, data)
 	c.wsMu.Unlock()
 	return err
@@ -1419,6 +1471,10 @@ func (c *Client) runPullModeWithTrafficReport(ctx context.Context, duration time
 			return
 		case <-timeout:
 			return
+		case <-c.reconnectSignal:
+			// IP 漂移 / 外部触发 → 立刻退出 backoff,让 outer loop 重试 WS
+			log.Printf("[Agent] Pull-mode backoff interrupted by reconnect signal")
+			return
 		case <-trafficTicker.C:
 			if err := c.sendTrafficHTTP(ctx); err != nil {
 				log.Printf("[Agent] Pull mode traffic report failed: %v", err)
@@ -1470,6 +1526,10 @@ func (c *Client) waitWithTrafficReport(ctx context.Context, duration time.Durati
 		case <-c.stopCh:
 			return
 		case <-timeout:
+			return
+		case <-c.reconnectSignal:
+			// IP 漂移 / 外部触发 → 立刻退出 backoff,让 outer loop 重试 WS
+			log.Printf("[Agent] WS backoff interrupted by reconnect signal")
 			return
 		case <-trafficTicker.C:
 			if err := c.sendTrafficHTTP(ctx); err != nil {

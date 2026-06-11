@@ -57,6 +57,11 @@ const (
 	WebSocketReadDeadline       = 10 * time.Second
 	WebSocketHeartbeatInterval  = 30 * time.Second
 	WebSocketIdleDeadline       = 5 * time.Minute
+	// 单次 WriteMessage 上限。没有这个会卡到 TCP retransmission(~15min),
+	// 直接拖死 runMessageLoop → Stop() wg.Wait 永久阻塞 → systemctl restart 假死。
+	WebSocketWriteDeadline = 10 * time.Second
+	// Stop() 等 goroutine 退出的兜底超时,超过就放弃 + log,避免 systemd 等到 TimeoutStopSec。
+	AgentStopTimeout = 5 * time.Second
 )
 
 const (
