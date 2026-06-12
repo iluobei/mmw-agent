@@ -296,6 +296,20 @@ func main() {
 	log.Printf("[Main] Shutdown complete")
 }
 
+// geoMirrorTemplates 下载 v2ray-rules-dat geoip/geosite 的镜像列表(按 %s = 文件名拼接)。
+// 顺序选择 v6 友好 → 国内可达 → GitHub 原始,任一成功即停。
+//
+// 背景:GitHub Release 重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
+// 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直接 connect: network is unreachable → geoip.dat
+// 拿不到 → 嵌入式 xray 启动 routing 引用 geoip:cn 加载失败 → server 整个起不来。
+//
+// jsdelivr 全球 CDN 同时提供 v4/v6;ghproxy 同款。GitHub 原始保留兜底(国内有 v4 时可达)。
+var geoMirrorTemplates = []string{
+	"https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/%s",
+	"https://mirror.ghproxy.com/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
+	"https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/%s",
+}
+
 func ensureGeoData() {
 	exePath, err := os.Executable()
 	if err != nil {
@@ -304,27 +318,49 @@ func ensureGeoData() {
 	}
 	dir := filepath.Dir(exePath)
 
-	files := map[string]string{
-		"geoip.dat":   "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
-		"geosite.dat": "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
-	}
-
-	for name, url := range files {
+	for _, name := range []string{"geoip.dat", "geosite.dat"} {
 		dest := filepath.Join(dir, name)
 		if _, err := os.Stat(dest); err == nil {
 			continue
 		}
-		log.Printf("[Main] Downloading %s ...", name)
-		if err := downloadFile(dest, url); err != nil {
-			log.Printf("[Main] Failed to download %s: %v", name, err)
-		} else {
-			log.Printf("[Main] Downloaded %s to %s", name, dest)
+		log.Printf("[Main] Downloading %s (trying %d mirrors)...", name, len(geoMirrorTemplates))
+		var lastErr error
+		downloaded := false
+		for i, tpl := range geoMirrorTemplates {
+			url := fmt.Sprintf(tpl, name)
+			if err := downloadFile(dest, url); err != nil {
+				lastErr = err
+				log.Printf("[Main] mirror %d/%d (%s) failed: %v", i+1, len(geoMirrorTemplates), shortHost(url), err)
+				continue
+			}
+			log.Printf("[Main] Downloaded %s from mirror %d/%d (%s)", name, i+1, len(geoMirrorTemplates), shortHost(url))
+			downloaded = true
+			break
+		}
+		if !downloaded {
+			log.Printf("[Main] Failed to download %s from all mirrors (last error: %v) — embedded xray routing rules using geoip:xxx will fail to load",
+				name, lastErr)
 		}
 	}
 }
 
+// shortHost 从完整 URL 提取 host 部分给日志短一点
+func shortHost(rawurl string) string {
+	if i := strings.Index(rawurl, "://"); i >= 0 {
+		rest := rawurl[i+3:]
+		if j := strings.Index(rest, "/"); j >= 0 {
+			return rest[:j]
+		}
+		return rest
+	}
+	return rawurl
+}
+
 func downloadFile(dest, url string) error {
-	resp, err := http.Get(url)
+	// 给单镜像下载加 timeout — 之前裸 http.Get 无超时,纯 v6 机器 dial v4 会卡到 TCP 内核 timeout (~75s),
+	// 多镜像 fallback 失去意义。30s 足够正常下完几 MB 的 geoip.dat。
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}
