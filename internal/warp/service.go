@@ -195,39 +195,44 @@ func (s *Service) BuildOutbounds() ([]map[string]any, error) {
 		address = append(address, s.state.AddrV6+"/128")
 	}
 
-	common := map[string]any{
-		"protocol": "wireguard",
-		"settings": map[string]any{
-			"secretKey": s.state.PrivateKey,
-			"address":   address,
-			"peers": []map[string]any{
-				{
-					"publicKey": s.state.PeerPubKey,
-					"endpoint":  s.state.PeerEndpoint,
+	// builder 每次分配独立 map — 之前用 copyMap 浅拷,settings 是同一 map 引用,
+	// 修 v4 的 settings.domainStrategy 会污染 v6,埋了隐藏 bug。改成 closure 直接生成两份独立。
+	//
+	// domainStrategy 必须放在 settings 里(xray wireguard outbound 的字段),不是 outbound 根属性。
+	// 之前的实现把它写在根属性 → xray 启动时这个字段被忽略,settings 里的 ForceIP 沿用 →
+	// 实际行为是 "解析后随便用任一 IP",拿不到 v4-only / v6-only 优先级控制 → 跨 v4/v6 流量混用。
+	build := func(tag, domainStrategy string) map[string]any {
+		return map[string]any{
+			"tag":      tag,
+			"protocol": "wireguard",
+			"settings": map[string]any{
+				"secretKey": s.state.PrivateKey,
+				"address":   address,
+				"peers": []map[string]any{
+					{
+						"publicKey": s.state.PeerPubKey,
+						"endpoint":  s.state.PeerEndpoint,
+					},
 				},
+				"reserved": reservedInts,
+				// MTU 1420 = WireGuard 默认值,Cloudflare WARP 推荐值
+				"mtu": 1420,
+				// noKernelTun: false 强制用 userspace gVisor TUN — 不依赖宿主机 tun 模块 / CAP_NET_ADMIN。
+				// 默认行为 (true) 在多数 VPS 上会让 wireguard outbound silently 失败:xray accept 进 outbound
+				// 但 wg 内部 dial UDP 因权限不够卡住,不报错,流量空转。3x-ui WarpModal.tsx 同款显式 false。
+				"noKernelTun": false,
+				// wg 模块内部解析 Cloudflare endpoint(engage.cloudflareclient.com:2408)时的策略:
+				// ForceIPv4v6 = v4 优先 → v6 fallback;ForceIPv6v4 = v6 优先 → v4 fallback。
+				// 跟 outbound tag 配套:warp-v4 给纯 v4 客户端 / warp-v6 给纯 v6 / dual-stack 走对应优先。
+				"domainStrategy": domainStrategy,
 			},
-			"reserved": reservedInts,
-			// MTU 1420 = WireGuard 默认值,Cloudflare WARP 推荐值
-			"mtu": 1420,
-			// noKernelTun: false 强制用 userspace gVisor TUN — 不依赖宿主机 tun 模块 / CAP_NET_ADMIN。
-			// 默认行为 (true) 在多数 VPS 上会让 wireguard outbound silently 失败:xray accept 进 outbound
-			// 但 wg 内部 dial UDP 因权限不够卡住,不报错,流量空转。3x-ui WarpModal.tsx 同款显式 false。
-			"noKernelTun": false,
-			// wg 模块内部域名解析策略 — Cloudflare API 返回 endpoint 是域名形式
-			// (engage.cloudflareclient.com:2408),ForceIP 让 wg 在内部解析 + dial。
-			"domainStrategy": "ForceIP",
-		},
+		}
 	}
 
-	v4 := copyMap(common)
-	v4["tag"] = "warp-v4"
-	v4["domainStrategy"] = "ForceIPv4v6"
-
-	v6 := copyMap(common)
-	v6["tag"] = "warp-v6"
-	v6["domainStrategy"] = "ForceIPv6v4"
-
-	return []map[string]any{v4, v6}, nil
+	return []map[string]any{
+		build("warp-v4", "ForceIPv4v6"),
+		build("warp-v6", "ForceIPv6v4"),
+	}, nil
 }
 
 // ---------- 持久化 ----------
