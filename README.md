@@ -2,6 +2,50 @@
 
 妙妙屋X 远程服务器代理程序。部署在子服务器上，负责与主控（miaomiaowux）通信，上报流量/速度数据，并接受主控的远程管理指令。
 
+## 部署方式
+
+### 方式 1:Docker(推荐)
+
+镜像内置 embedded xray-core(纯 Go 库) + nginx + WSS / Reality 反代所需的全套依赖,拉起即可用。
+
+```bash
+docker run -d \
+  --name mmw-agent \
+  --network host \
+  --restart unless-stopped \
+  -e MMWX_LISTEN_PORT=12888 \
+  -e MMWX_MASTER_URL=https://master.example.com \
+  -e MMWX_MASTER_TOKEN=<主控生成的 token> \
+  -v $(pwd)/config:/etc/mmw-agent \
+  -v $(pwd)/xray-config:/usr/local/etc/xray \
+  -v $(pwd)/nginx-cert:/etc/nginx/cert \
+  -v $(pwd)/nginx-servers:/etc/nginx/servers \
+  ghcr.io/iluobei/mmw-agent:latest
+```
+
+或用 [docker-compose.yml](docker-compose.yml):
+
+```bash
+docker compose up -d
+```
+
+**强制约束**:
+- **必须 host 网络模式**(`--network host` / `network_mode: host`)。xray 入站端口由用户在主控前端动态创建,bridge 模式得每开一个就改 `-p` 映射,且 agent 监听端口给主控反向连接也走宿主网络。容器 entrypoint 启动时检测 bridge 模式会直接退出报错。
+- **主控添加 server 时选 embedded 模式**。镜像里没有外部 xray binary,只有嵌入式 xray-core,主控必须按 embedded 协议对接。
+- 调试时绕过 host 检查:`-e MMWX_REQUIRE_HOST_NETWORK=0`(不推荐,有概率端口冲突)。
+
+### 方式 2:二进制 + systemd(传统裸机部署)
+
+通过主控前端「添加 server」生成的一键脚本安装,流程跟原来一致 — 自动装 xray binary + 配 systemd + 注册到主控。
+
+```bash
+# 主控 UI 给的安装命令,大致形如:
+curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | bash -s -- \
+    --master https://master.example.com --token xxxxx
+```
+
+
+
 <details>
 <summary>更新日志</summary>
 

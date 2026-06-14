@@ -23,6 +23,7 @@ import (
 	"mmw-agent/internal/discovery"
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/limiter"
+	"mmw-agent/internal/util"
 	"mmw-agent/internal/version"
 	"mmw-agent/internal/xrayctl"
 	"mmw-agent/internal/xrpc"
@@ -99,12 +100,13 @@ func (h *ManageHandler) RestartXray() error {
 }
 
 // restartEmbeddedXray 重启已有的 embedded xray，处理 tunnel 模式端口冲突。
+// nginx 控制走 nginxIsActive/nginxStop/nginxStart helper(docker 模式自动 fallback 到 binary 直接命令)。
 func (h *ManageHandler) restartEmbeddedXray() error {
 	stoppedNginx := false
 	if h.configNeedsPort443() {
-		if out, err := exec.Command("systemctl", "is-active", "nginx").Output(); err == nil && strings.TrimSpace(string(out)) == "active" {
+		if nginxIsActive() {
 			log.Printf("[Manage] Stopping nginx before embedded xray restart (tunnel mode)")
-			_ = exec.Command("systemctl", "stop", "nginx").Run()
+			_ = nginxStop()
 			stoppedNginx = true
 		}
 	}
@@ -113,7 +115,7 @@ func (h *ManageHandler) restartEmbeddedXray() error {
 
 	if stoppedNginx {
 		log.Printf("[Manage] Restarting nginx after embedded xray restart")
-		_ = exec.Command("systemctl", "start", "nginx").Run()
+		_ = nginxStart()
 	}
 
 	return err
@@ -190,14 +192,18 @@ func (h *ManageHandler) lazyStartEmbeddedXray() error {
 	for _, p := range constants.DefaultXrayConfigPaths {
 		if _, err := os.Stat(p); err == nil {
 			log.Printf("[Manage] Lazy-starting embedded Xray with config: %s", p)
-			_ = exec.Command("systemctl", "stop", "xray").Run()
-			_ = exec.Command("systemctl", "disable", "xray").Run()
+			// systemctl stop/disable xray:docker 镜像里没有外部 xray,跳过 systemctl 调用
+			// (失败 noise 也省了);裸机仍然保留原行为停掉外部 xray 释放端口
+			if !util.IsDocker() {
+				_ = exec.Command("systemctl", "stop", "xray").Run()
+				_ = exec.Command("systemctl", "disable", "xray").Run()
+			}
 
 			// 先停 nginx 释放端口（tunnel 模式 xray 需要监听 443）
 			stoppedNginx := false
-			if out, err := exec.Command("systemctl", "is-active", "nginx").Output(); err == nil && strings.TrimSpace(string(out)) == "active" {
+			if nginxIsActive() {
 				log.Printf("[Manage] Stopping nginx before embedded xray start")
-				_ = exec.Command("systemctl", "stop", "nginx").Run()
+				_ = nginxStop()
 				stoppedNginx = true
 			}
 
@@ -205,7 +211,7 @@ func (h *ManageHandler) lazyStartEmbeddedXray() error {
 			if err := ex.Start(); err != nil {
 				log.Printf("[Manage] Embedded xray start failed: %v", err)
 				if stoppedNginx {
-					_ = exec.Command("systemctl", "start", "nginx").Run()
+					_ = nginxStart()
 				}
 				return fmt.Errorf("start embedded xray: %w", err)
 			}
@@ -216,7 +222,7 @@ func (h *ManageHandler) lazyStartEmbeddedXray() error {
 
 			if stoppedNginx {
 				log.Printf("[Manage] Restarting nginx after embedded xray start")
-				_ = exec.Command("systemctl", "start", "nginx").Run()
+				_ = nginxStart()
 			}
 			return nil
 		}
@@ -567,6 +573,16 @@ func (h *ManageHandler) HandleXrayInstall(w http.ResponseWriter, r *http.Request
 
 	if !h.authenticate(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	// Docker 镜像里强制 embedded 模式,xray-core 作为 Go 库编进 binary,不需要外部 xray;
+	// install-release.sh 内部走 systemctl,容器里跑不通也没意义。
+	if util.IsDocker() {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Docker 镜像内置 embedded xray-core,无需安装外部 xray binary",
+		})
 		return
 	}
 
@@ -1137,6 +1153,17 @@ func (h *ManageHandler) HandleNginxInstall(w http.ResponseWriter, r *http.Reques
 		Domain string `json:"domain"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+
+	// Docker 镜像已经 apt 预装 nginx + symlink 兼容 /usr/local/nginx/* 路径,
+	// 不需要跑 install-nginx.sh(脚本依赖 systemd,容器里跑不通)。
+	// 跟主控 installNginxLocal 早返做法一致。
+	if util.IsDocker() {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"success": true,
+			"message": "Docker 镜像已预装 nginx,无需安装",
+		})
+		return
+	}
 
 	log.Printf("[Manage] Starting Nginx installation (async)...")
 	nginxInstalling.Store(true)

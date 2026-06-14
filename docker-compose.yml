@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  mmw-agent:
+    image: ghcr.io/iluobei/mmw-agent:latest
+    container_name: mmw-agent
+    restart: unless-stopped
+
+    # host 模式强制:xray 入站端口动态创建(用户在主控加一个就开一个),bridge 模式得跟着改 -p 映射;
+    # agent 监听端口给主控反向连接,bridge 又得多映射一个。entrypoint 启动时检测 bridge 直接退出。
+    network_mode: host
+
+    environment:
+      # 主控连过来的端口(默认 12888)
+      - MMWX_LISTEN_PORT=12888
+      # 主控地址(必填)
+      - MMWX_MASTER_URL=https://master.example.com
+      # 主控添加 server 时给的 token(必填)
+      - MMWX_MASTER_TOKEN=<填写主控端生成的 agent token>
+      # 强制 embedded — Docker 镜像不含外部 xray binary,只能 embedded
+      - MMWX_XRAY_MODE=embedded
+      # 容器探测(Dockerfile 已经设了,这里写一遍兜底)
+      - DOCKER=1
+
+    volumes:
+      # agent config.yaml(可选;用 env 也能覆盖大部分配置)
+      - ./config:/etc/mmw-agent
+      # xray config(embedded 模式 agent 自己维护;映射出来方便排查)
+      - ./xray-config:/usr/local/etc/xray
+      # nginx 证书(主控下发后 agent 写在这)
+      - ./nginx-cert:/etc/nginx/cert
+      # nginx servers 配置(WSS 入站时 agent 写在这)
+      - ./nginx-servers:/etc/nginx/servers

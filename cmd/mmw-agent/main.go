@@ -26,6 +26,7 @@ import (
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/handler"
 	"mmw-agent/internal/securechan"
+	"mmw-agent/internal/util"
 	"mmw-agent/internal/warp"
 )
 
@@ -130,9 +131,13 @@ func main() {
 		}
 
 		// 停止外部 Xray 避免端口冲突
-		log.Printf("[Main] Stopping external xray service before embedded start...")
-		_ = exec.Command("systemctl", "stop", "xray").Run()
-		_ = exec.Command("systemctl", "disable", "xray").Run()
+		// Docker 镜像里没有外部 xray binary 也没有 systemd,跳过 systemctl 调用避免无谓的失败 noise;
+		// embedded 模式直接接管,不会有端口冲突。
+		if !util.IsDocker() {
+			log.Printf("[Main] Stopping external xray service before embedded start...")
+			_ = exec.Command("systemctl", "stop", "xray").Run()
+			_ = exec.Command("systemctl", "disable", "xray").Run()
+		}
 
 		ensureGeoData()
 		initXrayConfig(configPath, cfg.StealMode)
