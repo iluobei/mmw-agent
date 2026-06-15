@@ -786,6 +786,16 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 		"stats": stats,
 	}
 
+	// 系统级网卡累计 RX/TX —— 主控按 server.traffic_source='system' 时改用这两个值替代 xray 流量,
+	// 跟 VPS 服务商面板的"网卡流量"口径对齐。boot_time_unix 给主控做 reboot 判定的辅助:同一 boot
+	// 周期内 rx/tx 是单调累加,跨 boot 才会归零 → 主控据此区分"agent 暂时丢状态"vs"系统真重启"。
+	sysRx, sysTx := c.getSystemNetworkStats()
+	payloadMap["system"] = map[string]int64{
+		"rx_total":       sysRx,
+		"tx_total":       sysTx,
+		"boot_time_unix": c.startTime.Unix(),
+	}
+
 	if c.embeddedXray != nil {
 		onlineUsers := c.collectOnlineUsers()
 		if len(onlineUsers) > 0 {
@@ -1242,8 +1252,15 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 	c.lastUserTrafficSnap = nil
 	c.lastLimitEvalTime = now
 
+	// 系统级网卡累计,见 sendTrafficData 同段注释 —— WS / HTTP 两条上报路径保持一致。
+	sysRx, sysTx := c.getSystemNetworkStats()
 	payload, _ := json.Marshal(map[string]interface{}{
 		"stats": stats,
+		"system": map[string]int64{
+			"rx_total":       sysRx,
+			"tx_total":       sysTx,
+			"boot_time_unix": c.startTime.Unix(),
+		},
 	})
 
 	u, err := url.Parse(c.config.MasterURL)
