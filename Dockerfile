@@ -36,9 +36,14 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" -o /out/mmw-agent ./cmd/mmw-agent
 
 # ─── Stage 2: runtime ───
-FROM debian:bookworm-slim
+# Final stage - 用 nginx 官方 Docker base(mainline-bookworm),跟主控 Dockerfile + install-nginx.sh 同款
+# "最新 nginx mainline"语义。该镜像默认编译 --with-http_v3_module + 静态链 QuicTLS,完整支持 listen ... quic。
+# debian:bookworm-slim apt 装的 nginx 1.22.x 不带 HTTP/3 模块,会导致 WSS / Reality 入站若用上 quic
+# 指令时 nginx 启动报 "invalid parameter quic"。base 仍是 debian bookworm 系列,其它 apt 包正常装。
+FROM nginx:mainline-bookworm
 
-# nginx 用 apt 装(WSS / reality 入站要用),symlink 兼容业务代码硬编码的 /usr/local/nginx/* 路径
+# nginx 由 base image 预装(WSS / Reality 入站要用):二进制 /usr/sbin/nginx 跟 apt 装的同位置,
+# 配置 /etc/nginx/* 路径不变,现有 /usr/local/nginx/* symlink 链路零改动
 # (跟主控 Dockerfile 完全对称做法 — agent 代码里所有 /usr/local/nginx/sbin/nginx 路径直接 work)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -47,7 +52,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     bash \
     procps \
-    nginx \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /usr/local/nginx/sbin \
               /etc/nginx/cert \

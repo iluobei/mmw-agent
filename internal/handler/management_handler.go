@@ -4838,8 +4838,15 @@ case $ARCH in
     *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
 esac
 
-RELEASE_URL="https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
-echo "Downloading from $RELEASE_URL..."
+# 镜像链 — 顺序尝试,任一成功即停。
+# 必要性:GitHub Release binary 实际重定向到 objects.githubusercontent.com,该域名只有 A 记录(无 AAAA),
+# 纯 v6 机器(如澳门 Debee mo-d.2ha.me)直连 github 会 "network is unreachable" → 升级永远失败。
+# ghproxy / gh-proxy 提供 v4+v6 双栈反代,放在前面让 v6-only 机器优先命中。
+MIRRORS=(
+    "https://mirror.ghproxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://gh-proxy.com/https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    "https://github.com/iluobei/mmw-agent/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+)
 # 优先 curl,没有就用 wget;两者都没就按发行版包管理器装一个 — 跟 install.sh 同款逻辑
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     echo "未检测到 curl/wget,尝试自动安装 curl..."
@@ -4861,13 +4868,26 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         exit 1
     fi
 fi
-if command -v curl >/dev/null 2>&1; then
-    # --connect-timeout: TCP 握手最长 10s
-    # --max-time:     整个传输上限 180s — GitHub CDN 偶发卡死时,不加 max-time 会无声 hang
-    #                 (历史问题:client 取消后 agent 这边 sseStreamCmd 跟着 cmd.Wait 一起永远等下去)
-    curl -fsSL --connect-timeout 10 --max-time 180 -o /tmp/mmw-agent-new "$RELEASE_URL"
-else
-    wget -q --show-progress --connect-timeout=10 --read-timeout=180 -O /tmp/mmw-agent-new "$RELEASE_URL"
+# --connect-timeout TCP 握手最长 10s;--max-time 整个传输上限 180s — 镜像偶发卡死时,不加 max-time 会无声 hang。
+download_ok=0
+for url in "${MIRRORS[@]}"; do
+    echo "Downloading from $url ..."
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 10 --max-time 180 -o /tmp/mmw-agent-new "$url"; then
+            download_ok=1
+            break
+        fi
+    else
+        if wget -q --connect-timeout=10 --read-timeout=180 -O /tmp/mmw-agent-new "$url"; then
+            download_ok=1
+            break
+        fi
+    fi
+    echo "  → 该镜像失败,尝试下一个..."
+done
+if [ "$download_ok" != "1" ]; then
+    echo "ERROR: 所有镜像均下载失败(GitHub + ghproxy + gh-proxy 全部不可达)" >&2
+    exit 1
 fi
 
 chmod +x /tmp/mmw-agent-new

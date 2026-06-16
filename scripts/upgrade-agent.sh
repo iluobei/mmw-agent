@@ -37,30 +37,44 @@ case $ARCH in
 esac
 log "架构: $ARCH_NAME"
 
-# 2. 解析目标版本 URL
+# 2. 解析目标版本 path(URL 前缀由镜像链各自接上)
 if [ "$TARGET" = "latest" ]; then
-    URL="https://github.com/${REPO}/releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
+    PATH_SUFFIX="releases/latest/download/mmw-agent-linux-${ARCH_NAME}"
     log "目标: GitHub latest"
 else
     # 允许带或不带 v 前缀
     case "$TARGET" in v*) TAG="$TARGET" ;; *) TAG="v$TARGET" ;; esac
-    URL="https://github.com/${REPO}/releases/download/${TAG}/mmw-agent-linux-${ARCH_NAME}"
+    PATH_SUFFIX="releases/download/${TAG}/mmw-agent-linux-${ARCH_NAME}"
     log "目标: $TAG"
 fi
 
 # 3. 下载到临时位置(--max-time 防止网络卡死无限等)
+# 镜像链 — 纯 v6 机器直连 github 会"network is unreachable"(release binary 重定向到无 AAAA 的
+# objects.githubusercontent.com)。ghproxy/gh-proxy 提供 v4+v6 双栈反代,放前面优先命中。
+MIRRORS=(
+    "https://mirror.ghproxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
+    "https://gh-proxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
+    "https://github.com/${REPO}/${PATH_SUFFIX}"
+)
 TMP="$(mktemp /tmp/mmw-agent-new.XXXXXX)"
 trap 'rm -f "$TMP"' EXIT
-log "下载 $URL ..."
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 180 -o "$TMP" "$URL" \
-        || err "下载失败(curl)"
-elif command -v wget >/dev/null 2>&1; then
-    wget -q --connect-timeout=10 --read-timeout=180 -O "$TMP" "$URL" \
-        || err "下载失败(wget)"
-else
-    err "没有 curl/wget,无法下载"
-fi
+download_ok=0
+for URL in "${MIRRORS[@]}"; do
+    log "下载 $URL ..."
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL --connect-timeout 10 --max-time 180 -o "$TMP" "$URL"; then
+            download_ok=1; break
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -q --connect-timeout=10 --read-timeout=180 -O "$TMP" "$URL"; then
+            download_ok=1; break
+        fi
+    else
+        err "没有 curl/wget,无法下载"
+    fi
+    log "  → 该镜像失败,尝试下一个..."
+done
+[ "$download_ok" = "1" ] || err "所有镜像均下载失败(GitHub + ghproxy + gh-proxy 全部不可达)"
 SIZE=$(du -h "$TMP" | cut -f1)
 NEW_MD5=$(md5sum "$TMP" | awk '{print $1}')
 log "下载完成: $SIZE, md5=$NEW_MD5"
