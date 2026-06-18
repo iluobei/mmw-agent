@@ -61,14 +61,6 @@ const DefaultConfigJSON = `{
             },
             {
                 "type": "field",
-                "domain": [
-                    "geosite:openai"
-                ],
-                "marktag": "fix_openai",
-                "outboundTag": "direct"
-            },
-            {
-                "type": "field",
                 "ip": [
                     "geoip:private"
                 ],
@@ -167,14 +159,6 @@ const TunnelConfigJSON = `{
                 ],
                 "marktag": "ban_geoip_cn",
                 "outboundTag": "block"
-            },
-            {
-                "type": "field",
-                "domain": [
-                    "geosite:openai"
-                ],
-                "marktag": "fix_openai",
-                "outboundTag": "direct"
             },
             {
                 "type": "field",

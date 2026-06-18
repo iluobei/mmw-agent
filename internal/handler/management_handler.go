@@ -11,12 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
-	"syscall"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"mmw-agent/internal/constants"
@@ -37,19 +37,19 @@ var nginxInstalling atomic.Bool
 
 // ManageHandler 处理子端管理接口请求。
 type ManageHandler struct {
-	configToken          string
-	configPath           string
-	restartMethod        string
-	restartCommand       string
-	xrayMode             string
-	embeddedXray         *embedded.EmbeddedXray
-	embeddedMu           sync.Mutex
-	onEmbeddedXrayStart  func(*embedded.EmbeddedXray)
+	configToken         string
+	configPath          string
+	restartMethod       string
+	restartCommand      string
+	xrayMode            string
+	embeddedXray        *embedded.EmbeddedXray
+	embeddedMu          sync.Mutex
+	onEmbeddedXrayStart func(*embedded.EmbeddedXray)
 	// inboundsMu 串行化所有 manageInbound 操作(包括新的 add-client/remove-client),
 	// 防止主控并发绑多个用户时:1) 配置文件 read-modify-write 撕裂;
 	// 2) 主控旧 GET→remove+add 路径下相互覆盖丢 client。
 	// 配置文件只有一份,锁不需要 per-inbound 粒度,直接 handler 全局即可。
-	inboundsMu           sync.Mutex
+	inboundsMu sync.Mutex
 }
 
 // 创建管理处理器。
@@ -1817,7 +1817,8 @@ func (h *ManageHandler) PromoteAllTagsOnStartup() {
 // dedupeXrayConfigTagsOnDisk 是绝对兜底:把 xray config 主文件里的同 tag inbound/outbound
 // 去重后写回。无论是历史残留还是任何代码路径写入,只要 agent 重启就清干净一次。
 // 保留策略:**保留第一份**(早出现的通常是真实业务数据,后面的是 race 累加出来的副本)。
-//   tag 为空的条目原样保留(可能是 vless reality 模板的中间态;不该出现但不在此处擦除)。
+//
+//	tag 为空的条目原样保留(可能是 vless reality 模板的中间态;不该出现但不在此处擦除)。
 func (h *ManageHandler) dedupeXrayConfigTagsOnDisk() {
 	configPath := h.findXrayConfigPath()
 	if configPath == "" {
@@ -1864,7 +1865,7 @@ func dedupeTaggedArrayInPlace(config map[string]interface{}, key string) int {
 		return 0
 	}
 	type slot struct {
-		idx  int  // 在 kept 里的位置
+		idx   int                    // 在 kept 里的位置
 		first map[string]interface{} // 第一份(我们就地往它里面合并 clients)
 	}
 	seen := map[string]*slot{}
@@ -4362,7 +4363,6 @@ func (h *ManageHandler) ensureRoutingRules(config map[string]interface{}) bool {
 	requiredRules := []map[string]interface{}{
 		{"type": "field", "protocol": []interface{}{"bittorrent"}, "marktag": "ban_bt", "outboundTag": "block"},
 		{"type": "field", "ip": []interface{}{"geoip:cn"}, "marktag": "ban_geoip_cn", "outboundTag": "block"},
-		{"type": "field", "domain": []interface{}{"geosite:openai"}, "marktag": "fix_openai", "outboundTag": "direct"},
 		{"type": "field", "ip": []interface{}{"geoip:private"}, "outboundTag": "block"},
 	}
 
@@ -5322,9 +5322,9 @@ func (h *ManageHandler) HandleLimiter(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		InboundTag     string `json:"inbound_tag"`
-		NodeLimit      uint64 `json:"node_limit"`
-		Users          []struct {
+		InboundTag string `json:"inbound_tag"`
+		NodeLimit  uint64 `json:"node_limit"`
+		Users      []struct {
 			UID         int    `json:"uid"`
 			Email       string `json:"email"`
 			SpeedLimit  uint64 `json:"speed_limit"`

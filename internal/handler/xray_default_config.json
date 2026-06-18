@@ -61,14 +61,6 @@
             },
             {
                 "type": "field",
-                "domain": [
-                    "geosite:openai"
-                ],
-                "marktag": "fix_openai",
-                "outboundTag": "direct"
-            },
-            {
-                "type": "field",
                 "ip": [
                     "geoip:private"
                 ],
