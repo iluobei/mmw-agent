@@ -49,6 +49,11 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.2 (2026-06-18)
+- 🌈修改用户网速的统计方式
+- 🌈升级镜像nginx版本
+- 🛠️ fix:vless reality出站缺少sniffing.exclude配置
+
 ### v0.3.1 (2026-06-15)
 - 🌈增加docker镜像(beta)
 - 🌈增加系统流量上报
