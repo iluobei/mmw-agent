@@ -49,6 +49,9 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.3 (2026-06-19)
+- 🛠️ fix:移除fix openai规则
+
 ### v0.3.2 (2026-06-18)
 - 🌈修改用户网速的统计方式
 - 🌈升级镜像nginx版本
