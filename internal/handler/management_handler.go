@@ -4141,6 +4141,13 @@ func (h *ManageHandler) EnsureXrayConfig() *EnsureXrayConfigResult {
 		modified = true
 	}
 
+	// 8a9f8c9 移除 fix_openai 路由规则,但残留在老 agent 的 config.json 里 —
+	// 启动期顺手清掉,跟主控的 migration 双端对齐,避免触发"配置漂移"提示。
+	if h.removeDeprecatedRoutingRules(config) {
+		result.AddedSections = append(result.AddedSections, "removed_deprecated_routing_rules")
+		modified = true
+	}
+
 	// 兜底 tag 去重(这里是 agent 每次启动 + 任何配置写入都会经过的检查路径,挂一道保险)。
 	if removed := dedupeTaggedArrayInPlace(config, "inbounds"); removed > 0 {
 		result.AddedSections = append(result.AddedSections, fmt.Sprintf("dedupe_inbounds_removed=%d", removed))
@@ -4401,6 +4408,43 @@ func (h *ManageHandler) ensureRoutingRules(config map[string]interface{}) bool {
 		routing["rules"] = rules
 	}
 	return added
+}
+
+// removeDeprecatedRoutingRules 一次性清理已废弃的路由规则(按 marktag 白名单匹配)。
+// 历史版本 ensureRoutingRules 注入过 fix_openai 等规则,新版本不再需要,但残留在老 agent 的 config.json 里 —
+// 启动期顺手清掉,避免长期跟主控 snapshot 不一致触发"配置漂移"提示。
+// 返回 true 表示有改动,调用方据此触发 marshal+writeFile(沿用 EnsureXrayConfig 已有写回路径)。
+// 幂等:第二次启动 rules 里已无废弃 marktag → 返回 false,no-op。
+func (h *ManageHandler) removeDeprecatedRoutingRules(config map[string]interface{}) bool {
+	deprecated := map[string]bool{
+		"fix_openai": true, // 8a9f8c9 移除,geosite:openai → direct
+	}
+	routing, _ := config["routing"].(map[string]interface{})
+	if routing == nil {
+		return false
+	}
+	rules, _ := routing["rules"].([]interface{})
+	if len(rules) == 0 {
+		return false
+	}
+	kept := make([]interface{}, 0, len(rules))
+	removed := 0
+	for _, r := range rules {
+		rule, _ := r.(map[string]interface{})
+		if rule != nil {
+			if tag, _ := rule["marktag"].(string); deprecated[tag] {
+				removed++
+				continue
+			}
+		}
+		kept = append(kept, r)
+	}
+	if removed == 0 {
+		return false
+	}
+	routing["rules"] = kept
+	log.Printf("[EnsureXrayConfig] removeDeprecatedRoutingRules: removed %d rule(s) (deprecated marktag)", removed)
+	return true
 }
 
 // ================== 证书部署 ==================
