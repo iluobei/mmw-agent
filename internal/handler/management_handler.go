@@ -4790,9 +4790,17 @@ func (h *ManageHandler) HandleValidateSite(w http.ResponseWriter, r *http.Reques
 			"message": "index.html exists",
 		})
 	case "proxy":
+		// 限定 http(s) scheme,拒绝 file:// 等;`--` 终止 flag 解析,杜绝 site_value 以 -K/-o 开头被 curl 当参数。
+		if !util.IsHTTPURL(strings.TrimSpace(req.SiteValue)) {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"success": false,
+				"message": "site_value 必须是 http(s):// 地址",
+			})
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "5", req.SiteValue)
+		cmd := exec.CommandContext(ctx, "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "5", "--", req.SiteValue)
 		out, err := cmd.Output()
 		if err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{
@@ -5625,6 +5633,13 @@ func (h *ManageHandler) HandleUpdateMasterURL(w http.ResponseWriter, r *http.Req
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.MasterURL == "" {
 		writeError(w, http.StatusBadRequest, "master_url required")
+		return
+	}
+	req.MasterURL = strings.TrimSpace(req.MasterURL)
+	// 必须是合法 http(s) URL 且无控制字符 —— 否则换行会注入任意 YAML 行到 config.yaml
+	// (如注入 master_public_key 指向攻击者公钥,造成 master 私钥轮换后也无法驱逐)。
+	if !util.IsHTTPURL(req.MasterURL) {
+		writeError(w, http.StatusBadRequest, "master_url 必须是 http(s):// 合法地址且不含控制字符")
 		return
 	}
 

@@ -79,6 +79,23 @@ func ValidateCertKeyPEM(certPEM, keyPEM string) error {
 	return nil
 }
 
+// NoControlChars 报告 s 不含换行/回车/其它控制字符。把值写进 config.yaml 单行前用它净化,
+// 杜绝 YAML 行注入(例如主控被攻破后把 master_public_key 注进 agent 配置造成无法驱逐的持久化)。
+func NoControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// IsHTTPURL 报告 s 是 http(s):// 开头且不含控制字符的 URL。用于校验 master_url、validate-site
+// 的目标,拒绝 file:// 等非 http scheme 与注入字符。
+func IsHTTPURL(s string) bool {
+	return NoControlChars(s) && (strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://"))
+}
+
 // ValidHostname 报告 s 是否为合法主机名(仅字母数字、点、连字符),
 // 用于把域名拼进文件路径前的净化,杜绝目录穿越(如 "../../etc/cron.d/x")。
 func ValidHostname(s string) bool {

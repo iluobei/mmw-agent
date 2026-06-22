@@ -90,6 +90,40 @@ func TestValidHostname(t *testing.T) {
 	}
 }
 
+func TestNoControlChars(t *testing.T) {
+	good := []string{"http://x.com", "abc-123", "https://a.b/c?d=e"}
+	bad := []string{"a\nb", "a\rb", "a\tb", "x\x00y", "u\x7f"}
+	for _, s := range good {
+		if !NoControlChars(s) {
+			t.Errorf("NoControlChars(%q) = false, want true", s)
+		}
+	}
+	for _, s := range bad {
+		if NoControlChars(s) {
+			t.Errorf("NoControlChars(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestIsHTTPURL(t *testing.T) {
+	good := []string{"http://a.com", "https://a.com/x"}
+	bad := []string{
+		"file:///etc/passwd", "ftp://a", "a.com", "",
+		"http://a\nmaster_public_key: evil", // YAML 注入应被拒
+		"-Kfile",
+	}
+	for _, s := range good {
+		if !IsHTTPURL(s) {
+			t.Errorf("IsHTTPURL(%q) = false, want true", s)
+		}
+	}
+	for _, s := range bad {
+		if IsHTTPURL(s) {
+			t.Errorf("IsHTTPURL(%q) = true, want false", s)
+		}
+	}
+}
+
 // genCertKey 生成一对自签证书/私钥的 PEM,用于校验逻辑测试。
 func genCertKey(t *testing.T) (certPEM, keyPEM string) {
 	t.Helper()

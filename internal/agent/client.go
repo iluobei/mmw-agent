@@ -2358,6 +2358,10 @@ func (c *Client) registerTrafficTicker(t *time.Ticker) func() {
 }
 
 func (c *Client) persistConfigField(key, value string) error {
+	// 净化:值不得含换行/控制字符,否则会注入任意 YAML 行到 config.yaml(主控被攻破时的持久化提权)。
+	if !util.NoControlChars(value) {
+		return fmt.Errorf("persistConfigField: 字段 %q 的值含非法控制字符,拒绝写入", key)
+	}
 	cfgPath := "/etc/mmw-agent/config.yaml"
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
 		return nil
