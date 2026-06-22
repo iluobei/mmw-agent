@@ -26,11 +26,26 @@ import (
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/handler"
 	"mmw-agent/internal/securechan"
+	"mmw-agent/internal/selfupdate"
 	"mmw-agent/internal/util"
 	"mmw-agent/internal/warp"
 )
 
 func main() {
+	// 隐藏子命令:校验升级二进制签名,供升级脚本在替换前调用(用内嵌公钥验签)。
+	// 必须在 flag.Parse 之前拦截。
+	if len(os.Args) >= 2 && os.Args[1] == "__verify-update" {
+		if len(os.Args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: mmw-agent __verify-update <binary> <sig>")
+			os.Exit(2)
+		}
+		if err := selfupdate.VerifyFile(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintln(os.Stderr, "verify failed:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	configPath := flag.String("config", "", "Path to config file")
 	configPathShort := flag.String("c", "", "Path to config file (shorthand)")
 	flag.Parse()

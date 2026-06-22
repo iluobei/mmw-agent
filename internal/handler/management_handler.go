@@ -730,6 +730,13 @@ func (h *ManageHandler) setXrayConfig(w http.ResponseWriter, r *http.Request) {
 		configPath = constants.DefaultXrayConfigPaths[0]
 	}
 
+	// 主控正常下发 xray 配置只带 config(走默认路径);带 path 时必须落在 xray 配置目录内,
+	// 杜绝"主控被攻破后用 req.Path 任意写文件 → RCE"。
+	if req.Path != "" && !util.PathWithinDirs(req.Path, xrayWriteDirs()) {
+		writeError(w, http.StatusForbidden, "config path outside allowed xray directories")
+		return
+	}
+
 	dir := filepath.Dir(configPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create directory: %v", err))
@@ -1295,6 +1302,12 @@ func (h *ManageHandler) setNginxConfig(w http.ResponseWriter, r *http.Request) {
 		configPath = constants.DefaultNginxConfigPaths[0]
 	}
 
+	// 带 path 时必须落在 nginx 配置目录内,杜绝任意路径写(主控被攻破时的 RCE 主链)。
+	if req.Path != "" && !util.PathWithinDirs(req.Path, nginxWriteDirs()) {
+		writeError(w, http.StatusForbidden, "config path outside allowed nginx directories")
+		return
+	}
+
 	backupPath := configPath + ".bak." + time.Now().Format("20060102150405")
 	if content, err := os.ReadFile(configPath); err == nil {
 		os.WriteFile(backupPath, content, 0644)
@@ -1695,20 +1708,9 @@ func (h *ManageHandler) saveNginxConfigFile(w http.ResponseWriter, r *http.Reque
 
 	req.Path = filepath.Clean(req.Path)
 
-	allowedDirs := []string{
-		constants.NginxConfigDirPaths[0],
-		constants.NginxConfigDirPaths[4],
-	}
-
-	allowed := false
-	for _, dir := range allowedDirs {
-		if strings.HasPrefix(req.Path, dir) {
-			allowed = true
-			break
-		}
-	}
-
-	if !allowed {
+	// 用目录边界判定,而非 strings.HasPrefix —— 后者会把 "/etc/nginx-evil/x" 误判为
+	// 在 "/etc/nginx" 之内,造成任意写旁路。
+	if !util.PathWithinDirs(req.Path, nginxWriteDirs()) {
 		writeError(w, http.StatusForbidden, "Path not allowed")
 		return
 	}
@@ -4495,6 +4497,17 @@ func (h *ManageHandler) HandleCertDeploy(w http.ResponseWriter, r *http.Request)
 }
 
 func deployCertFiles(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
+	// 证书目标路径管理员可自定义,无法白名单收死;主防御是内容必须为真实 PEM 证书/私钥
+	// (写进 cron/脚本/authorized_keys 也不会被解析执行),路径黑名单兜底敏感目录。
+	if err := util.ValidateCertKeyPEM(certPEM, keyPEM); err != nil {
+		return err
+	}
+	if err := util.CertPathSafe(certPath); err != nil {
+		return fmt.Errorf("cert path: %w", err)
+	}
+	if err := util.CertPathSafe(keyPath); err != nil {
+		return fmt.Errorf("key path: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
 		return fmt.Errorf("create cert dir: %w", err)
 	}
@@ -4612,6 +4625,12 @@ func (h *ManageHandler) HandleNginxSetupSSL(w http.ResponseWriter, r *http.Reque
 	}
 
 	domain := strings.ToLower(strings.TrimSpace(req.Domain))
+
+	// domain 会拼进 servers/{domain}.conf,必须是合法主机名,否则可路径穿越写任意文件。
+	if !util.ValidHostname(domain) {
+		writeError(w, http.StatusBadRequest, "invalid domain")
+		return
+	}
 
 	// confDir 选择:优先用 nginx -V 拿编译路径(权威),不用就 fallback stat(老逻辑兼容)。
 	// 老逻辑的 bug:install-nginx.sh 异步装时,stat 容易在 5s deploy 窗口里返回"不存在" →
@@ -5180,29 +5199,41 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     fi
 fi
 # --connect-timeout TCP 握手最长 10s;--max-time 整个传输上限 180s — 镜像偶发卡死时,不加 max-time 会无声 hang。
+dl() { # dl <url> <outfile>
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 180 -o "$2" "$1"
+    else
+        wget -q --connect-timeout=10 --read-timeout=180 -O "$2" "$1"
+    fi
+}
+# 二进制与同名 .sig 签名必须来自【同一镜像】,两者都成功才算该镜像可用。
 download_ok=0
 for url in "${MIRRORS[@]}"; do
     echo "Downloading from $url ..."
-    if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --connect-timeout 10 --max-time 180 -o /tmp/mmw-agent-new "$url"; then
-            download_ok=1
-            break
-        fi
-    else
-        if wget -q --connect-timeout=10 --read-timeout=180 -O /tmp/mmw-agent-new "$url"; then
-            download_ok=1
-            break
-        fi
+    if dl "$url" /tmp/mmw-agent-new && dl "${url}.sig" /tmp/mmw-agent-new.sig; then
+        download_ok=1
+        break
     fi
-    echo "  → 该镜像失败,尝试下一个..."
+    echo "  → 该镜像失败(二进制或签名缺失),尝试下一个..."
 done
 if [ "$download_ok" != "1" ]; then
-    echo "ERROR: 所有镜像均下载失败(GitHub + ghproxy + gh-proxy 全部不可达)" >&2
+    echo "ERROR: 所有镜像均下载失败(二进制或签名不可达)" >&2
     exit 1
 fi
 
 chmod +x /tmp/mmw-agent-new
 echo "Download complete, binary size: $(du -h /tmp/mmw-agent-new | cut -f1)"
+
+# 签名校验:用【当前正在运行】的 agent 内嵌公钥校验新二进制,通过才替换。
+# 私钥离线(GitHub secret / 本地未提交脚本),主控与本仓库都没有 → 主控被攻破也签不出能过校验的二进制。
+SELF_BIN="$(command -v mmw-agent || echo /usr/local/bin/mmw-agent)"
+echo "Verifying signature ..."
+if ! "$SELF_BIN" __verify-update /tmp/mmw-agent-new /tmp/mmw-agent-new.sig; then
+    echo "ERROR: 升级二进制签名校验失败,已拒绝替换" >&2
+    rm -f /tmp/mmw-agent-new /tmp/mmw-agent-new.sig
+    exit 1
+fi
+echo "Signature OK."
 
 # 替换二进制(systemd Restart=always 会在 agent 退出后拉起新版本)。
 # 直接 cp 到 /usr/local/bin/mmw-agent 会触发 "Text file busy",因为正在运行的 mmw-agent 进程占着该 inode。

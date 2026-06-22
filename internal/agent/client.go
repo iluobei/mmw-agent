@@ -29,6 +29,7 @@ import (
 	"mmw-agent/internal/embedded"
 	"mmw-agent/internal/limiter"
 	"mmw-agent/internal/securechan"
+	"mmw-agent/internal/util"
 	"mmw-agent/internal/xrayconf"
 	"mmw-agent/internal/xrayctl"
 
@@ -1931,6 +1932,17 @@ func (c *Client) handleCertDeploy(payload WSCertDeployPayload) {
 func deployCert(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
 	if certPath == "" || keyPath == "" {
 		return fmt.Errorf("deploy paths are required")
+	}
+	// 与 HTTP/RPC 侧 deployCertFiles 同一套防御:内容必须为真实 PEM 证书/私钥,
+	// 路径不得落在敏感目录。防止主控被攻破后经 WS cert_deploy 任意写文件 → RCE。
+	if err := util.ValidateCertKeyPEM(certPEM, keyPEM); err != nil {
+		return err
+	}
+	if err := util.CertPathSafe(certPath); err != nil {
+		return fmt.Errorf("cert path: %w", err)
+	}
+	if err := util.CertPathSafe(keyPath); err != nil {
+		return fmt.Errorf("key path: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
 		return fmt.Errorf("create cert dir: %w", err)

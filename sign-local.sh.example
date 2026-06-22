@@ -1,0 +1,12 @@
+#!/bin/bash
+# 本地升级签名脚本【模板】。用法:
+#   cp sign-local.sh.example sign-local.sh   # sign-local.sh 已被 .gitignore 忽略
+#   编辑 sign-local.sh,把 AGENT_UPDATE_PRIVATE_KEY 填成你的 base64 私钥
+#   ./sign-local.sh build/mmw-agent-linux-amd64    # 产出 build/mmw-agent-linux-amd64.sig
+#
+# ⚠ sign-local.sh 含 Ed25519 私钥,切勿提交、切勿贴进任何对话/issue。
+# 私钥与编进 internal/selfupdate/verify.go 的公钥成对;CI 用 GitHub secret
+# AGENT_UPDATE_PRIVATE_KEY 注入同一把私钥。
+set -e
+export AGENT_UPDATE_PRIVATE_KEY="在这里粘贴你的 base64 私钥"
+cd "$(dirname "$0")/tools/sign" && go run . "$@"

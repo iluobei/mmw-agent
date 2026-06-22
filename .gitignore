@@ -25,6 +25,9 @@ go.work.sum
 # env file
 .env
 
+# 本地升级签名脚本(含 Ed25519 私钥,切勿提交);模板见 sign-local.sh.example
+sign-local.sh
+
 traffic-info-*
 .claude 
 build

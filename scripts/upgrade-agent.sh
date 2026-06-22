@@ -57,7 +57,7 @@ MIRRORS=(
     "https://github.com/${REPO}/${PATH_SUFFIX}"
 )
 TMP="$(mktemp /tmp/mmw-agent-new.XXXXXX)"
-trap 'rm -f "$TMP"' EXIT
+trap 'rm -f "$TMP" "$TMP.sig"' EXIT
 download_ok=0
 for URL in "${MIRRORS[@]}"; do
     log "下载 $URL ..."
@@ -78,6 +78,35 @@ done
 SIZE=$(du -h "$TMP" | cut -f1)
 NEW_MD5=$(md5sum "$TMP" | awk '{print $1}')
 log "下载完成: $SIZE, md5=$NEW_MD5"
+
+# 3b. 签名校验:下载同名 .sig,用【已装】agent 的内嵌公钥验签(私钥离线,主控/本仓库都没有)。
+#     - rc=0  通过 → 继续
+#     - rc=1  新版 agent 明确判定签名不匹配 → 中止(防被篡改/MITM 的二进制)
+#     - 其它  当前是旧版 agent(不支持 __verify-update)或拿不到 .sig → 警告后继续(过渡期兼容)
+SIG="$TMP.sig"
+sig_ok=0
+for URL in "${MIRRORS[@]}"; do
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 60 -o "$SIG" "${URL}.sig" && { sig_ok=1; break; }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --connect-timeout=10 --read-timeout=60 -O "$SIG" "${URL}.sig" && { sig_ok=1; break; }
+    fi
+done
+if [ "$sig_ok" = 1 ] && [ -x "$BIN" ] && command -v timeout >/dev/null 2>&1; then
+    log "校验签名..."
+    set +e
+    VOUT=$(timeout 15 "$BIN" __verify-update "$TMP" "$SIG" 2>&1); VRC=$?
+    set -e
+    if [ "$VRC" = 0 ]; then
+        log "✅ 签名校验通过"
+    elif [ "$VRC" = 1 ]; then
+        err "签名校验失败(二进制与签名不匹配,拒绝升级): $VOUT"
+    else
+        log "[WARN] 无法验签(rc=$VRC,可能当前为旧版 agent 不支持),按原流程继续"
+    fi
+else
+    log "[WARN] 未获取到 .sig 或环境不支持,跳过验签"
+fi
 
 # 4. 与现有 binary 对比;一样就不动
 if [ -f "$BIN" ]; then
