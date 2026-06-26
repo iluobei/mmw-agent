@@ -5056,6 +5056,10 @@ func sseStreamCmd(w http.ResponseWriter, r *http.Request, cmd *exec.Cmd, complet
 		}
 	case <-r.Context().Done():
 		cmd.Process.Kill()
+		// 主动关 pipe 强制 scanner.Scan 返回 — 否则子进程若 fork 了继承 pipe 写端的后台进程,
+		// 两个 scanStream goroutine 会永久阻塞在 Read 上,泄漏 goroutine + fd。
+		stdout.Close()
+		stderr.Close()
 		sseEvent(w, flusher, map[string]string{"type": "error", "message": "request cancelled"})
 	}
 }

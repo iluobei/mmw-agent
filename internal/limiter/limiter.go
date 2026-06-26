@@ -33,8 +33,8 @@ func newEmailIPMap() *emailIPMap {
 type InboundInfo struct {
 	Tag            string
 	NodeSpeedLimit uint64    // Bytes/s, 0 = unlimited
-	UserInfo       *sync.Map // key: "tag|email" -> UserInfo
-	BucketHub      *sync.Map // key: "tag|email" -> *rate.Limiter
+	UserInfo       *sync.Map // key: "tag|email|uid" -> UserInfo (GetUserBucket 用 "tag|email|" 前缀匹配)
+	BucketHub      *sync.Map // key: email -> *rate.Limiter (与 GetUserBucket/SetUserSpeed/LookupBucketByEmail 一致)
 	UserOnlineIP   *sync.Map // key: email -> *emailIPMap (内层 ip -> *ipEntry + mu)
 }
 
@@ -78,14 +78,15 @@ func (l *Limiter) UpdateInboundLimiter(tag string, users []UserInfo) {
 		key := fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID)
 		info.UserInfo.Store(key, u)
 		limit := determineRate(info.NodeSpeedLimit, u.SpeedLimit)
+		// BucketHub 以 email 为 key(与 GetUserBucket 存的一致),不能用组合 key,否则 Load/Delete 永远 miss。
 		if limit > 0 {
-			if bucket, ok := info.BucketHub.Load(key); ok {
+			if bucket, ok := info.BucketHub.Load(u.Email); ok {
 				limiter := bucket.(*rate.Limiter)
 				limiter.SetLimit(rate.Limit(limit))
 				limiter.SetBurst(calcBurst(limit))
 			}
 		} else {
-			info.BucketHub.Delete(key)
+			info.BucketHub.Delete(u.Email)
 		}
 	}
 }

@@ -7,17 +7,21 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 
 	"mmw-agent/internal/agent"
 	"mmw-agent/internal/config"
@@ -30,6 +34,119 @@ import (
 	"mmw-agent/internal/util"
 	"mmw-agent/internal/warp"
 )
+
+// setupLogging 把日志输出切到 lumberjack 文件 + stdout。
+// 大小轮转:单文件 50MB,最多 2 个文件(当前 + 1 备份),超出自动删最旧。
+func setupLogging(logPath string) {
+	if logPath == "" {
+		logPath = config.DefaultLogPath
+	}
+	if err := os.MkdirAll(filepath.Dir(logPath), 0755); err != nil {
+		log.Printf("[Main] 创建日志目录失败,继续仅用 stdout: %v", err)
+		return
+	}
+	lj := &lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    50, // MB
+		MaxBackups: 1,  // 当前 + 1 备份 = 最多 2 个文件
+		MaxAge:     0,
+		Compress:   false,
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, lj))
+	// 兜底巡检(主轮转由 lumberjack 负责,这里 10 分钟扫一次)
+	go cleanupLogsLoop(filepath.Dir(logPath))
+}
+
+// setupMemoryLimit 给进程设内存软上限(GOMEMLIMIT 等价),让 GC 在接近上限时更激进回收。
+// 优先级:用户已设的 GOMEMLIMIT > MMWX_LOG... 不,> MMWX_MEM_LIMIT_MB > embedded 模式按系统内存 75% 自动设。
+// external 模式 agent 内存很小,不自动设(避免无谓的 GC 压力)。
+func setupMemoryLimit(embedded bool) {
+	// 用户已通过 GOMEMLIMIT 环境变量显式设置(runtime 启动时已生效)→ 尊重,不覆盖。
+	if debug.SetMemoryLimit(-1) != math.MaxInt64 {
+		return
+	}
+	if v := os.Getenv("MMWX_MEM_LIMIT_MB"); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			debug.SetMemoryLimit(int64(mb) << 20)
+			log.Printf("[Main] 内存软上限 %d MiB (MMWX_MEM_LIMIT_MB)", mb)
+			return
+		}
+	}
+	if !embedded {
+		return
+	}
+	total := readMemTotalBytes()
+	if total > 0 {
+		limit := total / 4 * 3 // 系统内存的 75%,留余量给系统/其他进程
+		debug.SetMemoryLimit(limit)
+		log.Printf("[Main] embedded 内存软上限 %d MiB (系统 %d MiB ×75%%)", limit>>20, total>>20)
+	}
+}
+
+// readMemTotalBytes 从 /proc/meminfo 读 MemTotal(kB),返回字节数;失败返回 0。
+func readMemTotalBytes() int64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	return parseMemTotalBytes(string(data))
+}
+
+// parseMemTotalBytes 解析 /proc/meminfo 文本,返回 MemTotal 的字节数(kB×1024);无 MemTotal 返回 0。
+func parseMemTotalBytes(meminfo string) int64 {
+	for _, line := range strings.Split(meminfo, "\n") {
+		if !strings.HasPrefix(line, "MemTotal:") {
+			continue
+		}
+		fields := strings.Fields(line) // ["MemTotal:", "1024000", "kB"]
+		if len(fields) >= 2 {
+			if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+				return kb * 1024
+			}
+		}
+		break
+	}
+	return 0
+}
+
+func cleanupLogsLoop(dir string) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	enforceMaxLogFiles(dir, "mmw-agent", 2)
+	for range ticker.C {
+		enforceMaxLogFiles(dir, "mmw-agent", 2)
+	}
+}
+
+// enforceMaxLogFiles 保留 dir 下以 prefix 开头的最新 keep 个文件,其余按修改时间从旧到新删除。
+func enforceMaxLogFiles(dir, prefix string, keep int) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type ft struct {
+		name string
+		mod  time.Time
+	}
+	var files []ft
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, ft{e.Name(), info.ModTime()})
+	}
+	if len(files) <= keep {
+		return
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
+	for _, f := range files[keep:] {
+		_ = os.Remove(filepath.Join(dir, f.name))
+	}
+}
 
 func main() {
 	// 隐藏子命令:校验升级二进制签名,供升级脚本在替换前调用(用内嵌公钥验签)。
@@ -81,7 +198,14 @@ func main() {
 		log.Fatalf("Invalid config: %v", err)
 	}
 
+	// 日志真实落地到文件 + 保留 stdout(供 systemd journald / 容器查看)。
+	setupLogging(cfg.LogPath)
+
+	// embedded 模式 agent 内联 xray 承载所有代理连接,设内存软上限让 GC 更早回收、抑制 RSS 暴涨。
+	setupMemoryLimit(cfg.XrayMode == "embedded")
+
 	log.Printf("[Main] Starting mmw-agent")
+	log.Printf("[Main] Log file: %s", cfg.LogPath)
 	log.Printf("[Main] Connection mode: %s", cfg.ConnectionMode)
 	log.Printf("[Main] Xray mode: %s", cfg.XrayMode)
 	log.Printf("[Main] Listen port: %s", cfg.ListenPort)

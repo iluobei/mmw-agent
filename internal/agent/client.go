@@ -933,6 +933,7 @@ func (c *Client) detectPublicIPv4() string {
 			TLSHandshakeTimeout: 3 * time.Second,
 		},
 	}
+	defer client.CloseIdleConnections() // 用完关连接池,避免每 30-60s 新建 Transport 的瞬时连接/goroutine 堆积
 	urls := []string{
 		"https://api4.ipify.org",
 		"https://ipv4.icanhazip.com",
@@ -973,6 +974,7 @@ func (c *Client) detectPublicIPv6() string {
 			TLSHandshakeTimeout: 5 * time.Second,
 		},
 	}
+	defer client.CloseIdleConnections() // 用完关连接池,避免每 30-60s 新建 Transport 的瞬时连接/goroutine 堆积
 	for _, u := range []string{
 		"https://6.ipw.cn",
 		"https://api6.ipify.org",

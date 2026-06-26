@@ -85,10 +85,9 @@ func (e *EmbeddedXray) Start() (retErr error) {
 		}
 		bucket := l.LookupBucketByEmail(email)
 		if bucket == nil {
-			log.Printf("[VisionLimiter] %s: skip (no bucket / unlimited)", email)
+			// 无限速用户走原零拷贝 splice 路径。这是每条连接热路径,不打日志(默认 VLESS-Vision 协议会刷爆)。
 			return nil
 		}
-		log.Printf("[VisionLimiter] %s: wrapping rawConn with bucket rate=%v burst=%d", email, bucket.Limit(), bucket.Burst())
 		return limiter.NewRateLimitedConn(rawConn, bucket)
 	})
 

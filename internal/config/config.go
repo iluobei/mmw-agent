@@ -27,7 +27,11 @@ type Config struct {
 	RestartMethod         string        `yaml:"restart_method"`
 	RestartCommand        string        `yaml:"restart_command"`
 	MasterPublicKey       string        `yaml:"master_public_key"`
+	LogPath               string        `yaml:"log_path"` // 日志文件路径，默认 /var/log/mmw-agent/mmw-agent.log
 }
+
+// DefaultLogPath 是 agent 日志文件默认路径（lumberjack 在同目录轮转生成备份）。
+const DefaultLogPath = "/var/log/mmw-agent/mmw-agent.log"
 
 // XrayServer 表示本机 Xray 节点配置。
 type XrayServer struct {
@@ -66,6 +70,7 @@ func fromEnvRaw() *Config {
 		RestartMethod:   os.Getenv("MMWX_RESTART_METHOD"),
 		RestartCommand:  os.Getenv("MMWX_RESTART_COMMAND"),
 		MasterPublicKey: os.Getenv("MMWX_MASTER_PUBLIC_KEY"),
+		LogPath:         os.Getenv("MMWX_LOG_PATH"),
 	}
 
 	if xrayConfig := os.Getenv("MMWX_XRAY_CONFIG"); xrayConfig != "" {
@@ -137,6 +142,9 @@ func (c *Config) Merge(env *Config) {
 	if env.MasterPublicKey != "" {
 		c.MasterPublicKey = env.MasterPublicKey
 	}
+	if env.LogPath != "" {
+		c.LogPath = env.LogPath
+	}
 }
 
 // 为空字段填充默认值。
@@ -158,6 +166,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.XrayMode == "" {
 		c.XrayMode = "external"
+	}
+	if c.LogPath == "" {
+		c.LogPath = DefaultLogPath
 	}
 
 	if len(c.XrayServers) == 0 {

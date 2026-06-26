@@ -15,9 +15,11 @@ replace github.com/xtls/xray-core => ../xray-core-vision-limiter
 require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/xtls/xray-core v1.260327.0
+	golang.org/x/crypto v0.49.0
 	golang.org/x/time v0.14.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -41,7 +43,6 @@ require (
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/xtls/reality v0.0.0-20260322125925-9234c772ba8f // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/exp v0.0.0-20241210194714-1829a127f884 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
