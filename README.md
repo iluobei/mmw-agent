@@ -49,6 +49,12 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.4 (2026-06-27)
+- 🌈增加agent签名验证，防篡改
+- 🌈增加agent路径验证
+- 🛠️ fix:RateLimitConn没有关闭连接
+- 🛠️ fix:github无法访问降级
+
 ### v0.3.3 (2026-06-19)
 - 🛠️ fix:移除fix openai规则
 
