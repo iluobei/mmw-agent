@@ -49,12 +49,13 @@ else
 fi
 
 # 3. 下载到临时位置(--max-time 防止网络卡死无限等)
-# 镜像链 — 纯 v6 机器直连 github 会"network is unreachable"(release binary 重定向到无 AAAA 的
-# objects.githubusercontent.com)。ghproxy/gh-proxy 提供 v4+v6 双栈反代,放前面优先命中。
+# 镜像链 — GitHub 优先,失败再自动降级到 CDN 代理。纯 v6 机器直连 github 会"network is unreachable"
+# (release binary 重定向到无 AAAA 的 objects.githubusercontent.com),会快速失败后降级到
+# ghproxy/gh-proxy(v4+v6 双栈反代)。
 MIRRORS=(
-    "https://mirror.ghproxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
-    "https://gh-proxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
     "https://github.com/${REPO}/${PATH_SUFFIX}"
+    "https://gh-proxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
+    "https://mirror.ghproxy.com/https://github.com/${REPO}/${PATH_SUFFIX}"
 )
 TMP="$(mktemp /tmp/mmw-agent-new.XXXXXX)"
 trap 'rm -f "$TMP" "$TMP.sig"' EXIT
