@@ -122,6 +122,19 @@ type Client struct {
 	// warpStatusFn 返回 agent 当前 WARP 是否已注册。auth + heartbeat 时调用上报给 master,
 	// 供 master 显示 server 卡片的 W 图标 badge。nil = 老 agent / 未注入 → 上报 false。
 	warpStatusFn func() bool
+
+	// 端口隐身钩子:WS 鉴权成功 → onWSConnected(主程序据此延迟关闭入站监听,隐藏端口);
+	// WS 断开 → onWSDisconnected(主程序立即重开监听,保证主控 HTTP/pull 回退可达)。
+	// nil = 未启用该特性 → 监听始终常开,行为同旧版。
+	onWSConnected    func()
+	onWSDisconnected func()
+}
+
+// SetListenGateHooks 注入"端口隐身"钩子(见 onWSConnected / onWSDisconnected 字段)。
+// main.go 仅在 cfg.HidePortOnWS 开启时调用。
+func (c *Client) SetListenGateHooks(onUp, onDown func()) {
+	c.onWSConnected = onUp
+	c.onWSDisconnected = onDown
 }
 
 // SetRPCMux 由 main.go 在注册完 /api/child/* 路由后注入。共享 mux 让 WS RPC 路径完全复用现有 handler。
@@ -518,6 +531,10 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 		c.wsSession = nil
 		c.wsSessionMu.Unlock()
 		conn.Close()
+		// WS 断开:立即重开入站监听,保证主控 HTTP/pull 回退可达(早于重连退避)。
+		if c.onWSDisconnected != nil {
+			c.onWSDisconnected()
+		}
 	}()
 
 	// 密钥交换（如果配置了 master 公钥）
@@ -542,6 +559,11 @@ func (c *Client) connectAndRun(ctx context.Context) error {
 	c.wsMu.Unlock()
 
 	log.Printf("[Agent] Connected and authenticated")
+
+	// WS 鉴权成功:主控指令将走 WS 反向 RPC,入站端口不再需要 → 通知主程序(延迟)关闭监听。
+	if c.onWSConnected != nil {
+		c.onWSConnected()
+	}
 
 	// 连接成功后立即上报 agent 信息（listen_port）
 	if err := c.sendHeartbeat(conn); err != nil {

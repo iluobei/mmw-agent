@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -379,9 +381,6 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// 启动 agent 客户端
-	agentClient.Start(ctx)
-
 	// 启动 HTTP 服务
 	// 先同步 bind,失败立即 fail-fast 退出进程,让 systemd 把服务标 failed
 	// (否则 ListenAndServe 失败但 WebSocket 出站还活,会造成 agent HTTP API 死、
@@ -410,12 +409,20 @@ func main() {
 			log.Fatalf("[Main] HTTP server bind failed on :%s: %v", cfg.ListenPort, err)
 		}
 	}
-	go func() {
-		log.Printf("[Main] HTTP server listening on :%s", cfg.ListenPort)
-		if err := server.Serve(httpLn); err != nil && err != http.ErrServerClosed {
-			log.Printf("[Main] HTTP server error: %v", err)
-		}
-	}()
+	log.Printf("[Main] HTTP server listening on :%s", cfg.ListenPort)
+	// gate 接管 Serve;初始保持监听(默认行为)。开启端口隐身后,WS 连上会(延迟)关闭监听、
+	// WS 断开立即重开。
+	gate := newListenGate(server, httpLn)
+
+	// 端口隐身:WS 可用期间关闭入站监听,让外部扫描探测不到 agent;主控指令此时走 WS 反向 RPC,
+	// 入站端口仅 WS 不可用时的 HTTP/pull 回退需要。钩子在 Start 之前注入,避免 WS 抢先连上时漏挂。
+	if cfg.HidePortOnWS != nil && *cfg.HidePortOnWS {
+		agentClient.SetListenGateHooks(gate.onWSConnected, gate.onWSDisconnected)
+		log.Printf("[Main] WS-stealth enabled: inbound :%s closes while WebSocket is connected", cfg.ListenPort)
+	}
+
+	// 启动 agent 客户端(在监听 + 钩子就绪之后)
+	agentClient.Start(ctx)
 
 	// 等待退出信号
 	sig := <-sigCh
@@ -423,6 +430,7 @@ func main() {
 
 	// 优雅退出
 	cancel()
+	gate.stop() // 停掉待执行的端口开关,避免退出过程中又重开监听
 	agentClient.Stop()
 	if embeddedXray != nil {
 		if err := embeddedXray.Stop(); err != nil {
@@ -438,6 +446,109 @@ func main() {
 	}
 
 	log.Printf("[Main] Shutdown complete")
+}
+
+// listenCloseGrace 是 WS 连上后延迟关闭入站监听的宽限期:给在途的 HTTP 回退请求收尾,
+// 并避免 WS 抖动时端口被频繁开关。
+const listenCloseGrace = 5 * time.Second
+
+// listenGate 运行时管理 agent 入站监听的开关。
+//
+// 思路:主控对 agent 的反向指令在 WS 可用时全部走 WS 反向 RPC,入站端口(默认 23889)只是
+// WS 不可用时的 HTTP/pull 回退通道。于是 WS 连上后(延迟)关闭监听以隐藏 agent,WS 断开后
+// 立即重开以保住回退。
+//
+// 实现上只开关 net.Listener、复用同一个 *http.Server(从不对 Server 调 Shutdown/Close,
+// 故可对新 Listener 反复 Serve)。所有状态由 mu 保护。
+type listenGate struct {
+	mu      sync.Mutex
+	server  *http.Server
+	addr    string       // 监听地址,如 ":23889"(已含 boot 阶段冲突切换后的最终端口)
+	ln      net.Listener // 当前监听;nil 表示已关闭
+	timer   *time.Timer  // 待执行的延迟关闭
+	stopped bool         // 进程退出中,忽略后续开关
+}
+
+// newListenGate 接管已 bind 的 listener 并开始 Serve(初始保持监听)。
+func newListenGate(server *http.Server, ln net.Listener) *listenGate {
+	g := &listenGate{server: server, addr: server.Addr, ln: ln}
+	g.serve(ln)
+	return g
+}
+
+func (g *listenGate) serve(ln net.Listener) {
+	go func() {
+		// ln.Close() 触发的 net.ErrClosed、Server.Shutdown 触发的 ErrServerClosed 都是预期收尾,不报错。
+		if err := g.server.Serve(ln); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			log.Printf("[Main] HTTP server error: %v", err)
+		}
+	}()
+}
+
+// onWSConnected:WS 鉴权成功,宽限期后关闭入站监听(隐藏端口)。
+func (g *listenGate) onWSConnected() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return
+	}
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	g.timer = time.AfterFunc(listenCloseGrace, func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.timer = nil
+		if g.stopped || g.ln == nil {
+			return
+		}
+		log.Printf("[Main] WebSocket connected; closing inbound listener on %s (stealth)", g.addr)
+		_ = g.ln.Close()
+		g.ln = nil
+	})
+}
+
+// onWSDisconnected:WS 断开,立即重开监听,保证主控 HTTP/pull 回退可达。
+func (g *listenGate) onWSDisconnected() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return
+	}
+	if g.timer != nil {
+		g.timer.Stop()
+		g.timer = nil
+	}
+	if g.ln != nil {
+		return // 已在监听
+	}
+	var ln net.Listener
+	var err error
+	for i := 0; i < 5; i++ {
+		if ln, err = net.Listen("tcp", g.addr); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err != nil {
+		log.Printf("[Main] WARN: reopen inbound listener on %s failed: %v (HTTP/pull fallback unavailable until next WS drop)", g.addr, err)
+		return
+	}
+	g.ln = ln
+	log.Printf("[Main] WebSocket down; inbound listener reopened on %s (fallback)", g.addr)
+	g.serve(ln)
+}
+
+// stop 在进程退出时调用:停掉待执行的关闭,并禁止后续开关(避免退出过程中又重开监听)。
+func (g *listenGate) stop() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopped = true
+	if g.timer != nil {
+		g.timer.Stop()
+		g.timer = nil
+	}
 }
 
 // geoMirrorTemplates 下载 v2ray-rules-dat geoip/geosite 的镜像列表(按 %s = 文件名拼接)。

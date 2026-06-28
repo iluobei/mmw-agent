@@ -28,6 +28,9 @@ type Config struct {
 	RestartCommand        string        `yaml:"restart_command"`
 	MasterPublicKey       string        `yaml:"master_public_key"`
 	LogPath               string        `yaml:"log_path"` // 日志文件路径，默认 /var/log/mmw-agent/mmw-agent.log
+	// HidePortOnWS 开启时:WS 连接可用期间关闭入站监听端口(隐藏 agent),WS 断开时立即重开以保证
+	// 主控 HTTP/pull 回退可达。*bool 区分"未配置"(默认 true)与显式 false。
+	HidePortOnWS *bool `yaml:"hide_port_on_ws"`
 }
 
 // DefaultLogPath 是 agent 日志文件默认路径（lumberjack 在同目录轮转生成备份）。
@@ -91,6 +94,10 @@ func fromEnvRaw() *Config {
 			config.SpeedReportInterval = d
 		}
 	}
+	if v := os.Getenv("MMWX_HIDE_PORT_ON_WS"); v != "" {
+		b := v == "1" || v == "true"
+		config.HidePortOnWS = &b
+	}
 
 	return config
 }
@@ -145,6 +152,9 @@ func (c *Config) Merge(env *Config) {
 	if env.LogPath != "" {
 		c.LogPath = env.LogPath
 	}
+	if env.HidePortOnWS != nil {
+		c.HidePortOnWS = env.HidePortOnWS
+	}
 }
 
 // 为空字段填充默认值。
@@ -169,6 +179,10 @@ func (c *Config) applyDefaults() {
 	}
 	if c.LogPath == "" {
 		c.LogPath = DefaultLogPath
+	}
+	if c.HidePortOnWS == nil {
+		v := true
+		c.HidePortOnWS = &v
 	}
 
 	if len(c.XrayServers) == 0 {
