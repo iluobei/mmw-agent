@@ -44,6 +44,10 @@ var KickCounter sync.Map // map[string]*int64
 
 type Limiter struct {
 	InboundInfo *sync.Map // key: tag -> *InboundInfo
+	// autoLimited 标记"当前正被自动限速(SetUserSpeed 临时覆盖)的 email"。
+	// GetOnlineUsers 的空闲 bucket 清理 与 UpdateInboundLimiter 的 limit==0 处理都必须跳过这些 email,
+	// 否则会把 auto 限速正在用的同一个 bucket 删掉/重置,导致新连接 GetUserBucket 新建无限 bucket → 限速形同虚设。
+	autoLimited sync.Map // key: email -> struct{}
 }
 
 func New() *Limiter {
@@ -78,16 +82,18 @@ func (l *Limiter) UpdateInboundLimiter(tag string, users []UserInfo) {
 		key := fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID)
 		info.UserInfo.Store(key, u)
 		limit := determineRate(info.NodeSpeedLimit, u.SpeedLimit)
-		// BucketHub 以 email 为 key(与 GetUserBucket 存的一致),不能用组合 key,否则 Load/Delete 永远 miss。
+		// BucketHub 以 email 为 key(与 GetUserBucket 存的一致),不能用组合 key,否则 Load 永远 miss。
 		if limit > 0 {
 			if bucket, ok := info.BucketHub.Load(u.Email); ok {
 				limiter := bucket.(*rate.Limiter)
 				limiter.SetLimit(rate.Limit(limit))
 				limiter.SetBurst(calcBurst(limit))
 			}
-		} else {
-			info.BucketHub.Delete(u.Email)
 		}
+		// 静态限速为 0(无限制):**什么都不做**。
+		// 既不能 Delete(b3b803a 的回归:删掉后存量连接持有的旧 bucket 与 SetUserSpeed 新建的 bucket 脱钩,
+		// 自动限速对存量连接失效),也不能原地置无限(会撤销正在生效的 auto 限速)。
+		// 空闲 bucket 统一由 GetOnlineUsers 清理,且那里会跳过正被 auto 限速的 email。
 	}
 }
 
@@ -201,12 +207,18 @@ func (l *Limiter) GetOnlineUsers(tag string) map[string][]string {
 	info := value.(*InboundInfo)
 	result := make(map[string][]string)
 
-	// Clean up stale buckets
+	// Clean up stale buckets(本周期没有活跃 IP 的 email)。
+	// 跳过正被 auto 限速的 email:它的 bucket 正被 SetUserSpeed 临时限速,删了之后新连接 GetUserBucket
+	// 会新建无限 bucket → auto 限速对新连接/重连失效(限速看起来"没用")。
 	info.BucketHub.Range(func(key, _ interface{}) bool {
 		email := key.(string)
-		if _, exists := info.UserOnlineIP.Load(email); !exists {
-			info.BucketHub.Delete(email)
+		if _, exists := info.UserOnlineIP.Load(email); exists {
+			return true
 		}
+		if _, auto := l.autoLimited.Load(email); auto {
+			return true
+		}
+		info.BucketHub.Delete(email)
 		return true
 	})
 
@@ -258,6 +270,8 @@ func (l *Limiter) SetUserSpeed(tag, email string, speedLimit uint64) {
 	}
 	info := value.(*InboundInfo)
 	if speedLimit > 0 {
+		// 标记该 email 正被 auto 限速,GetOnlineUsers/UpdateInboundLimiter 清理时跳过,防止 bucket 被删/重置。
+		l.autoLimited.Store(email, struct{}{})
 		if v, ok := info.BucketHub.Load(email); ok {
 			lim := v.(*rate.Limiter)
 			lim.SetLimit(rate.Limit(speedLimit))
@@ -266,6 +280,8 @@ func (l *Limiter) SetUserSpeed(tag, email string, speedLimit uint64) {
 			info.BucketHub.Store(email, rate.NewLimiter(rate.Limit(speedLimit), calcBurst(speedLimit)))
 		}
 	} else {
+		// 解除 auto 限速标记,后续空闲时允许 GetOnlineUsers 清理。
+		l.autoLimited.Delete(email)
 		// Restore to original rate — modify the existing bucket in place
 		// so existing connections (holding a reference) are also restored.
 		origLimit := l.getUserStaticLimit(info, tag, email)
