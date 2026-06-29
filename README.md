@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.5 (2026-06-29)
+- 🛠️ fix:WS连接时端口静默关闭
+- 🛠️ fix:自动限速功能bug导致限速失效
+
 ### v0.3.4 (2026-06-27)
 - 🌈增加agent签名验证，防篡改
 - 🌈增加agent路径验证
