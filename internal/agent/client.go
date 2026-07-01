@@ -30,6 +30,7 @@ import (
 	"mmw-agent/internal/limiter"
 	"mmw-agent/internal/securechan"
 	"mmw-agent/internal/util"
+	"mmw-agent/internal/version"
 	"mmw-agent/internal/xrayconf"
 	"mmw-agent/internal/xrayctl"
 
@@ -600,6 +601,7 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 		"public_ipv4":    publicIPv4,
 		"public_ipv6":    publicIPv6,
 		"warp_installed": warpInstalled,
+		"agent_version":  version.Version, // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
 		"capabilities": map[string]bool{
 			"rpc":    rpcAvailable,
 			"stream": rpcAvailable,

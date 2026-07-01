@@ -127,13 +127,11 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		return true
 	})
 
-	// Device limit check — 策略改为「踢最旧」(LRU evict):
+	// Device limit check — 策略:满额拒绝新连接(原 LRU「踢最旧」挤占模式已停用,保留备查):
 	//   - 已有该 ip → 仅更新 lastSeen,放行
 	//   - 新 ip 且 count < limit → 加进去,放行
-	//   - 新 ip 且 count >= limit → 找 lastSeen 最早的删,加新的进去,KickCounter[email]++,放行
-	//
-	// 注:依赖客户端连接 keepalive 超时让旧连接自然断;agent 无主动断 xray 连接的 API。
-	// 被踢的 IP 下次包到达时走"新 IP 加入"路径,如果还在超限会再次被踢出。
+	//   - 新 ip 且 count >= limit → 拒绝(reject=true),不加入、不驱逐;dispatcher 断流。
+	//     累计 KickCounter(触发上限次数)供主控通知。已在线的老连接不受影响。
 	now := time.Now()
 	if deviceLimit > 0 {
 		ipMap := newEmailIPMap()
@@ -145,23 +143,24 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		} else if len(em.m) < deviceLimit {
 			em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
 		} else {
-			// evict 最旧:扫一遍找 minLastSeen
-			var oldestIP string
-			var oldestTime time.Time
-			first := true
-			for k, v := range em.m {
-				if first || v.lastSeen.Before(oldestTime) {
-					oldestIP = k
-					oldestTime = v.lastSeen
-					first = false
-				}
-			}
-			if oldestIP != "" {
-				delete(em.m, oldestIP)
-			}
-			em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
-			// 累计 kick 次数(Phase 3B 上报用)
-			incrementKickCounter(email)
+			// 满额 + 新 IP → 拒绝新连接。原 LRU「踢最旧」挤占模式已停用,保留备查:
+			//   var oldestIP string
+			//   var oldestTime time.Time
+			//   first := true
+			//   for k, v := range em.m {
+			//       if first || v.lastSeen.Before(oldestTime) {
+			//           oldestIP = k
+			//           oldestTime = v.lastSeen
+			//           first = false
+			//       }
+			//   }
+			//   if oldestIP != "" {
+			//       delete(em.m, oldestIP)
+			//   }
+			//   em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
+			incrementKickCounter(email) // 累计"触发设备上限"次数(上报主控用于通知)
+			em.mu.Unlock()
+			return nil, false, true // 达到设备上限,拒绝新连接(dispatcher 会断流)
 		}
 		em.mu.Unlock()
 	} else {
