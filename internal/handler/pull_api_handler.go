@@ -57,10 +57,6 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"stats":   stats,
 	}
-	// pull 模式 user_rates 同 WS/HTTP 出口字段(老 master 不识别 → 自动跳过)
-	if rates := h.client.CollectUserRatesForReport(); len(rates) > 0 {
-		resp["user_rates"] = rates
-	}
 	w.Header().Set(constants.HeaderContentType, constants.ContentTypeJSON)
 	json.NewEncoder(w).Encode(resp)
 }

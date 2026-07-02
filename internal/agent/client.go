@@ -80,10 +80,6 @@ type Client struct {
 	lastLimitEvalTime   time.Time
 	lastUserTrafficSnap map[string]int64
 
-	// per-user 1s 环形 buffer (60s 历史),用于 3 档窗口平均瞬时速率
-	// 仅 embedded 模式生效;runUserRateSampler 独立 goroutine 每 1s 调一次 sampleUserRates
-	userRates *userRateRing
-
 	// 嵌入模式
 	embeddedXray *embedded.EmbeddedXray
 
@@ -243,7 +239,6 @@ func NewClient(cfg *config.Config) *Client {
 		startTime:       time.Now(),
 		currentMode:     ModePull,
 		reconnectSignal: make(chan struct{}, 1),
-		userRates:       newUserRateRing(),
 	}
 	// httpClient 用跟 WS 同款的 v4 优先 dialer — 否则 Go 默认 dialer 在 dual-stack 主机上
 	// Happy Eyeballs 偏好 v6,HTTP heartbeat 全程走 v6 → master 看 RemoteAddr 是 v6 →
@@ -300,17 +295,6 @@ func (c *Client) Start(ctx context.Context) {
 	// 后台 IP detect 循环 — 启动时立即跑一次,失败时 30s 重试,直到拿到 v4 / v6。
 	// 不阻塞 WS / HTTP / pull 模式的握手路径。
 	c.startIPProbeLoop(ctx)
-
-	// 方案 K — per-user 1s 速率采样 goroutine。统一走 collectLocalMetrics 拉 stats:
-	//   - embedded 模式:in-memory Value() 直接读,~μs 级
-	//   - external 模式:HTTP /debug/vars,localhost RTT ~ms 级,1s 一次开销可接受
-	// 独立 goroutine + 1s 间隔,跟现有 traffic(5s)/speed(3s) ticker 解耦。
-	// 仅当有 stats 源(embedded 嵌入了 xray,或 external 配了 xrayServers)才起;
-	// 都没有时跳过,sampler 拉不到任何数据是无用循环。
-	if c.embeddedXray != nil || len(c.xrayServers) > 0 {
-		c.wg.Add(1)
-		go c.runUserRateSampler(ctx)
-	}
 
 	mode := ConnectionMode(c.config.ConnectionMode)
 
@@ -854,11 +838,6 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 				payloadMap["user_speeds"] = speeds
 			}
 		}
-
-		// 方案 K — per-user 3 档窗口平均瞬时速率(来自独立 1s 采样 goroutine 维护的 ringbuffer)
-		if rates := c.CollectUserRatesForReport(); len(rates) > 0 {
-			payloadMap["user_rates"] = rates
-		}
 	}
 	c.lastTrafficTime = now
 
@@ -1309,10 +1288,6 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 			"tx_total":       sysTx,
 			"boot_time_unix": c.startTime.Unix(),
 		},
-	}
-	// 方案 K — 同 WS path 上报 user_rates,老 master 不识别字段会自动跳过
-	if rates := c.CollectUserRatesForReport(); len(rates) > 0 {
-		payloadMap["user_rates"] = rates
 	}
 	payload, _ := json.Marshal(payloadMap)
 
