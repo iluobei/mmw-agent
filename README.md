@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.6 (2026-07-03)
+- 🛠️ fix:不再计算用户网速上报
+- 🛠️ fix:客户端限制改为拒绝新连接
+
 ### v0.3.5 (2026-06-29)
 - 🛠️ fix:WS连接时端口静默关闭
 - 🛠️ fix:自动限速功能bug导致限速失效
