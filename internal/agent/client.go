@@ -586,6 +586,7 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 		"public_ipv6":    publicIPv6,
 		"warp_installed": warpInstalled,
 		"agent_version":  version.Version, // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
+		"xray_mode":      c.config.XrayMode, // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
 		"capabilities": map[string]bool{
 			"rpc":    rpcAvailable,
 			"stream": rpcAvailable,

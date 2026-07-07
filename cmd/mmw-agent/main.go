@@ -287,6 +287,9 @@ func main() {
 			log.Printf("[Main] Embedded mode: config auto-completed, added: %v", result.AddedSections)
 		}
 
+		// 启动自愈:给端口转发补齐 UDP + full-cone(修历史遗留的 tcp-only 入站 / freedom UseIP 出站)。
+		patchTunnelForwardUDPFullcone(configPath)
+
 		log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
 		embeddedXray = embedded.New(configPath)
 		if err := embeddedXray.Start(); err != nil {
@@ -811,6 +814,84 @@ func initXrayConfig(path string, stealMode string) {
 	}
 }
 
+// patchTunnelForwardUDPFullcone 启动自愈:扫描 xray config,给端口转发补齐 UDP + full-cone。
+//   - 转发入站(protocol tunnel / dokodemo-door,排除基础设施 api / tunnel-in):settings.network 缺 udp 就补成 "tcp,udp"。
+//     (api 是 gRPC 命令通道、tunnel-in 是 reality 443 的 TLS 入站,都只能 tcp,跳过。)
+//   - 转发出站(protocol freedom,tag 以 "tunnel-" 开头):domainStrategy 若为 UseIP* 则改 AsIs。
+//     UseIP 会按包重解析目标 → UDP 退化成对称 NAT;AsIs 不重解析,保住 full-cone。
+// 仅在有改动时写回,避免每次启动无谓写盘。
+func patchTunnelForwardUDPFullcone(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) <= 4 {
+		return
+	}
+	var config map[string]any
+	if err := json.Unmarshal(data, &config); err != nil {
+		return
+	}
+	changed := false
+
+	if inbounds, ok := config["inbounds"].([]any); ok {
+		for _, ibAny := range inbounds {
+			ib, _ := ibAny.(map[string]any)
+			if ib == nil {
+				continue
+			}
+			proto, _ := ib["protocol"].(string)
+			if proto != "tunnel" && proto != "dokodemo-door" {
+				continue
+			}
+			if tag, _ := ib["tag"].(string); tag == "api" || tag == "tunnel-in" {
+				continue
+			}
+			settings, _ := ib["settings"].(map[string]any)
+			if settings == nil {
+				continue
+			}
+			if net, _ := settings["network"].(string); !strings.Contains(net, "udp") {
+				settings["network"] = "tcp,udp"
+				changed = true
+			}
+		}
+	}
+
+	if outbounds, ok := config["outbounds"].([]any); ok {
+		for _, obAny := range outbounds {
+			ob, _ := obAny.(map[string]any)
+			if ob == nil {
+				continue
+			}
+			if proto, _ := ob["protocol"].(string); proto != "freedom" {
+				continue
+			}
+			if tag, _ := ob["tag"].(string); !strings.HasPrefix(tag, "tunnel-") {
+				continue
+			}
+			settings, _ := ob["settings"].(map[string]any)
+			if settings == nil {
+				continue
+			}
+			if ds, _ := settings["domainStrategy"].(string); strings.HasPrefix(ds, "UseIP") {
+				settings["domainStrategy"] = "AsIs"
+				changed = true
+			}
+		}
+	}
+
+	if !changed {
+		return
+	}
+	out, err := json.MarshalIndent(config, "", "    ")
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(path, out, 0644); err != nil {
+		log.Printf("[Main] tunnel UDP/full-cone 自愈补丁写回失败: %v", err)
+		return
+	}
+	log.Printf("[Main] tunnel UDP/full-cone 自愈补丁:已给端口转发补齐 udp / 修正 UseIP→AsIs")
+}
+
 // mergeXrayConfig 把 template 合并进 existing,返回合并后 JSON。
 // 合并语义:
 //   - inbounds / outbounds: 数组按 tag 合并 — 同 tag 用 template 的,template 没有的 tag 保留 existing 的
@@ -933,6 +1014,14 @@ func mergeRouting(existingRaw, templateRaw any) any {
 		}
 		rules = append(rules, r)
 	}
+	// 按优先级 stable 排序:端口转发(outboundTag tunnel-*,优先级0)置顶、tunnel-in→direct(4)沉底,
+	// 与运行时 add_rule 一致。否则重启走 mergeRouting 的 append 会把 existing 端口转发排到
+	// template 的 tunnel-in→direct 后面,被 xray 顺序短路匹配截胡(端口转发永久失效)。
+	sort.SliceStable(rules, func(i, j int) bool {
+		ri, _ := rules[i].(map[string]any)
+		rj, _ := rules[j].(map[string]any)
+		return handler.ClassifyRulePriority(ri) < handler.ClassifyRulePriority(rj)
+	})
 	merged["rules"] = rules
 	return merged
 }

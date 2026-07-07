@@ -41,4 +41,6 @@ miaomiaowux-frontend/.vite
 .idea
 VALIDATION_INTEGRATION_PLAN.md
 CLAUDE.md
-
+sign-local.sh.example
+sign-local.sh
+*_test.go

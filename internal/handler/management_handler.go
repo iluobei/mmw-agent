@@ -3183,14 +3183,14 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 		rules, _ := routing["rules"].([]interface{})
 		// 按 marktag 智能插入:1 user routed → 2 admin routed → 3 家宽/测速 warp → 4 其他。
 		// 同优先级内新规则居前;不重排现有规则(只决定新 rule 落点)。
-		newP := classifyRulePriority(req.Rule)
+		newP := ClassifyRulePriority(req.Rule)
 		insertAt := len(rules)
 		for i, r := range rules {
 			rm, ok := r.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if classifyRulePriority(rm) >= newP {
+			if ClassifyRulePriority(rm) >= newP {
 				insertAt = i
 				break
 			}
@@ -5718,7 +5718,7 @@ func (h *ManageHandler) ensureExternalXray() error {
 	return nil
 }
 
-// classifyRulePriority 把单条 routing rule 按 marktag/outboundTag 归类成 5 个优先级,数字越小越靠前:
+// ClassifyRulePriority 把单条 routing rule 按 marktag/outboundTag 归类成 5 个优先级,数字越小越靠前:
 //
 //	0 - 端口转发(outboundTag 以 "tunnel-" 开头),xray 按序匹配,必须置顶以免被下游 routed/warp/api 截胡
 //	1 - user 私有 routed 出站(marktag = "routed:<shortID>:u<username>:<labelSlug>",4 段)
@@ -5732,7 +5732,7 @@ func (h *ManageHandler) ensureExternalXray() error {
 // outboundTag = "tunnel-*" 是 miaomiaowuX 端口转发的命名约定(见前端 inbound-wizard generateTunnelTag),
 // 单独提到 priority 0 是因为 xray routing 按数组顺序短路匹配,这类规则若被 routed/warp 截胡,
 // 端口转发的语义就丢了。注意 "tunnel-in" 是 inboundTag(伪装入站),不会出现在 outboundTag,排除安全。
-func classifyRulePriority(rule map[string]interface{}) int {
+func ClassifyRulePriority(rule map[string]interface{}) int {
 	if rule == nil {
 		return 4
 	}
