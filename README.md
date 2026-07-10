@@ -49,6 +49,10 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.7 (2026-07-10)
+- 🌈增加snell协议
+- 🛠️ fix:snell协议子用户没有下发
+
 ### v0.3.6 (2026-07-03)
 - 🛠️ fix:不再计算用户网速上报
 - 🛠️ fix:客户端限制改为拒绝新连接
