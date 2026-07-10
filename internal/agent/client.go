@@ -828,6 +828,13 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 			payloadMap["online_users"] = onlineUsers
 		}
 
+		// 每 group 当前并发连接数(group="<user>|<物理节点ID>"),供主控聚合、用户视图展示。
+		if l := c.embeddedXray.GetLimiter(); l != nil {
+			if cc := l.ConnCountSnapshot(); len(cc) > 0 {
+				payloadMap["conn_counts"] = cc
+			}
+		}
+
 		if monitor := c.embeddedXray.GetSpeedMonitor(); monitor != nil && !c.lastTrafficTime.IsZero() {
 			elapsed := now.Sub(c.lastTrafficTime)
 			userDeltas := make(map[string]int64, len(stats.User))
@@ -1804,12 +1811,14 @@ type WSLimiterConfigPayload struct {
 	AutoSpeedRules []embedded.AutoSpeedLimitRule `json:"auto_speed_rules,omitempty"`
 }
 
-// WSUserLimitInfo 是单个用户的限速和设备数配置。
+// WSUserLimitInfo 是单个用户的限速和连接数配置。
+// DeviceLimit 现语义 = 并发连接上限(0=不限);ConnGroup 为连接数计数分组键(同组共享配额)。
 type WSUserLimitInfo struct {
 	UID         int    `json:"uid"`
 	Email       string `json:"email"`
 	SpeedLimit  uint64 `json:"speed_limit"`
 	DeviceLimit int    `json:"device_limit"`
+	ConnGroup   string `json:"conn_group,omitempty"` // "<user>|<物理父节点ID>";空=退化按 email 计数(老主控兼容)
 }
 
 // LicenseStatus 表示主控端下发的许可证状态。
@@ -2035,6 +2044,7 @@ func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
 			Email:       u.Email,
 			SpeedLimit:  u.SpeedLimit,
 			DeviceLimit: u.DeviceLimit,
+			ConnGroup:   u.ConnGroup,
 		}
 	}
 

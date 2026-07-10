@@ -1916,7 +1916,7 @@ func mergeInboundClients(dst, src map[string]interface{}) {
 	switch strings.ToLower(proto) {
 	case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
 		arrKey = "clients"
-	case "anytls":
+	case "anytls", "snell":
 		arrKey = "users"
 	case "socks", "http":
 		arrKey = "accounts"
@@ -2468,7 +2468,7 @@ func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.C
 	switch strings.ToLower(protocol) {
 	case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
 		arrKey = "clients"
-	case "anytls":
+	case "anytls", "snell":
 		arrKey = "users"
 	case "socks", "http":
 		arrKey = "accounts"
@@ -2744,6 +2744,8 @@ func matchClientCredential(a, b map[string]interface{}, protocol string) bool {
 		primaryKey = "id"
 	case "trojan", "shadowsocks", "anytls":
 		primaryKey = "password"
+	case "snell":
+		primaryKey = "psk"
 	case "hysteria":
 		primaryKey = "auth"
 	case "socks", "http":
@@ -3378,7 +3380,7 @@ func applyAddClientToConfig(config map[string]interface{}, tag string, client ma
 		switch strings.ToLower(protocol) {
 		case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
 			arrKey = "clients"
-		case "anytls":
+		case "anytls", "snell":
 			arrKey = "users"
 		case "socks", "http":
 			arrKey = "accounts"

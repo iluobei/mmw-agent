@@ -145,19 +145,24 @@ func (d *Dispatcher) getLink(ctx context.Context) (*transport.Link, *transport.L
 	}
 
 	if user != nil && len(user.Email) > 0 {
-		bucket, hasLimit, reject := d.Limiter.GetUserBucket(
-			sessionInbound.Tag,
-			user.Email,
-			sessionInbound.Source.Address.IP().String(),
-		)
-		if reject {
-			errors.LogWarning(ctx, "device limit reached: ", user.Email)
+		// 连接数限制:按 group 精确并发计数、满额拒绝。在建出站前断流(零出站占用);
+		// 放行则注册 ctx 结束时 ReleaseConn 精确 -1。group="" 表示不限/不计数,无需释放。
+		if ok, group := d.Limiter.AcquireConn(sessionInbound.Tag, user.Email); !ok {
+			errors.LogWarning(ctx, "connection limit reached: ", user.Email)
 			common.Close(outboundLink.Writer)
 			common.Close(inboundLink.Writer)
 			common.Interrupt(outboundLink.Reader)
 			common.Interrupt(inboundLink.Reader)
-			return nil, nil, errors.New("device limit reached: ", user.Email)
+			return nil, nil, errors.New("connection limit reached: ", user.Email)
+		} else if group != "" {
+			context.AfterFunc(ctx, func() { d.Limiter.ReleaseConn(group) })
 		}
+
+		bucket, hasLimit, _ := d.Limiter.GetUserBucket(
+			sessionInbound.Tag,
+			user.Email,
+			sessionInbound.Source.Address.IP().String(),
+		)
 		if hasLimit {
 			inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, bucket)
 			outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, bucket)
@@ -304,8 +309,21 @@ func (d *Dispatcher) DispatchLink(ctx context.Context, destination net.Destinati
 	// 然后写完 31 字节切换指令后立刻把 CanSpliceCopy 升级为 1 触发 kernel splice,**完全绕过 RateLimitedConn**。
 	// 强制设为 3 (disable splice) 让数据全程走 user-space buf.Writer/conn.Write,vision_limiter_hook
 	// 包的 wrap conn 才能拦截读写。详见 XrayR PR #757 + xray-core issue #3100。
-	if si := session.InboundFromContext(ctx); si != nil {
+	si := session.InboundFromContext(ctx)
+	if si != nil {
 		si.CanSpliceCopy = 3
+		// 连接数限制:DispatchLink 是 VLESS 等的真实数据路径(不经 getLink),必须在这里也做满额拒绝,
+		// 否则限制形同虚设(历史 device_limit 同样只挂在 getLink,对 DispatchLink 路径无效)。
+		if si.User != nil && len(si.User.Email) > 0 {
+			if ok, group := d.Limiter.AcquireConn(si.Tag, si.User.Email); !ok {
+				errors.LogWarning(ctx, "connection limit reached: ", si.User.Email)
+				common.Interrupt(outbound.Reader)
+				common.Close(outbound.Writer)
+				return errors.New("connection limit reached: ", si.User.Email)
+			} else if group != "" {
+				context.AfterFunc(ctx, func() { d.Limiter.ReleaseConn(group) })
+			}
+		}
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {

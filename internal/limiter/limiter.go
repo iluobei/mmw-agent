@@ -38,9 +38,94 @@ type InboundInfo struct {
 	UserOnlineIP   *sync.Map // key: email -> *emailIPMap (内层 ip -> *ipEntry + mu)
 }
 
-// KickCounter 累计每个 email 被「踢最旧」的次数(Phase 3B 上报给主控用,主控收到 delta → tg 通知)
-// 采用 sync.Map[email]*int64,累计语义(从 agent 启动开始单调递增);主控算 delta = current - prev_seen
+// KickCounter 累计每个 email 触发「连接数上限被拒绝」的次数(上报给主控算 delta → tg 通知)。
+// 采用 sync.Map[email]*int64,累计语义(从 agent 启动开始单调递增);主控算 delta = current - prev_seen。
+// (原为设备数「踢最旧」计数,现语义改为连接数超限拒绝次数。)
 var KickCounter sync.Map // map[string]*int64
+
+// connCount 每个 group 的**当前并发连接数**(group = "<user>|<物理父节点ID>",由主控下发)。
+// 一个用户在同一物理节点(含其路由出站子账户)的所有 email 共享同一 group → 共享一份连接配额。
+// AcquireConn 进连接 +1、ReleaseConn 出连接 -1;精确并发(靠 dispatcher 的 ctx AfterFunc 释放)。
+var connCount sync.Map // map[string]*atomic.Int64
+
+func connCounter(group string) *atomic.Int64 {
+	if v, ok := connCount.Load(group); ok {
+		return v.(*atomic.Int64)
+	}
+	v, _ := connCount.LoadOrStore(group, new(atomic.Int64))
+	return v.(*atomic.Int64)
+}
+
+// lookupUserInfo 按 (tag,email) 前缀扫描找到该用户的限流配置。
+func (l *Limiter) lookupUserInfo(tag, email string) (UserInfo, bool) {
+	value, ok := l.InboundInfo.Load(tag)
+	if !ok {
+		return UserInfo{}, false
+	}
+	info := value.(*InboundInfo)
+	var found UserInfo
+	var hit bool
+	expectedPrefix := fmt.Sprintf("%s|%s|", tag, email)
+	info.UserInfo.Range(func(k, v interface{}) bool {
+		key := k.(string)
+		if len(key) >= len(expectedPrefix) && key[:len(expectedPrefix)] == expectedPrefix {
+			found = v.(UserInfo)
+			hit = true
+			return false
+		}
+		return true
+	})
+	return found, hit
+}
+
+// AcquireConn 在新连接建立时调用:按 group 累计并发连接数并做「满额拒绝」判定。
+//   - 返回 ok=false → 已达连接上限,dispatcher 应断流(不建出站);同时累计 KickCounter 供主控通知。
+//   - 返回 ok=true  → 放行;调用方必须在连接结束时 ReleaseConn(group) 以精确 -1。
+//
+// connLimit<=0(不限)时仍计数(供用户视图展示当前连接数),但永不拒绝。
+// group 为空(老主控未下发 ConnGroup)时退化按 email 计数,行为仍正确(只是不跨 email 共享)。
+func (l *Limiter) AcquireConn(tag, email string) (ok bool, group string) {
+	u, found := l.lookupUserInfo(tag, email)
+	if !found {
+		return true, "" // 无该用户限流记录(如未下发)→ 放行不计数
+	}
+	group = u.ConnGroup
+	if group == "" {
+		group = email
+	}
+	connLimit := u.DeviceLimit // 现语义 = 并发连接上限
+	c := connCounter(group)
+	n := c.Add(1)
+	if connLimit > 0 && n > int64(connLimit) {
+		c.Add(-1) // 撤销本次占用
+		incrementKickCounter(email)
+		return false, ""
+	}
+	return true, group
+}
+
+// ReleaseConn 在连接结束时调用,把 group 的并发连接数 -1(下限 0)。
+func (l *Limiter) ReleaseConn(group string) {
+	if group == "" {
+		return
+	}
+	c := connCounter(group)
+	if c.Add(-1) < 0 {
+		c.Store(0)
+	}
+}
+
+// ConnCountSnapshot 返回各 group 当前并发连接数(>0 的项),供上报主控/用户视图展示。
+func (l *Limiter) ConnCountSnapshot() map[string]int64 {
+	out := make(map[string]int64)
+	connCount.Range(func(k, v interface{}) bool {
+		if n := v.(*atomic.Int64).Load(); n > 0 {
+			out[k.(string)] = n
+		}
+		return true
+	})
+	return out
+}
 
 type Limiter struct {
 	InboundInfo *sync.Map // key: tag -> *InboundInfo
@@ -111,7 +196,7 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 	nodeLimit := info.NodeSpeedLimit
 
 	var userLimit uint64
-	var deviceLimit, uid int
+	var uid int
 
 	// Find user info by scanning keys with matching tag and email prefix
 	info.UserInfo.Range(func(k, v interface{}) bool {
@@ -121,57 +206,20 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 		if len(key) >= len(expectedPrefix) && key[:len(expectedPrefix)] == expectedPrefix {
 			uid = u.UID
 			userLimit = u.SpeedLimit
-			deviceLimit = u.DeviceLimit
 			return false
 		}
 		return true
 	})
 
-	// Device limit check — 策略:满额拒绝新连接(原 LRU「踢最旧」挤占模式已停用,保留备查):
-	//   - 已有该 ip → 仅更新 lastSeen,放行
-	//   - 新 ip 且 count < limit → 加进去,放行
-	//   - 新 ip 且 count >= limit → 拒绝(reject=true),不加入、不驱逐;dispatcher 断流。
-	//     累计 KickCounter(触发上限次数)供主控通知。已在线的老连接不受影响。
+	// 连接数限制已迁到 AcquireConn(按 group 精确并发计数、满额拒绝),与此处解耦。
+	// 这里只记录 IP 给在线用户上报用(GetOnlineUsers 每周期重置)。reject 恒为 false。
 	now := time.Now()
-	if deviceLimit > 0 {
-		ipMap := newEmailIPMap()
-		actual, _ := info.UserOnlineIP.LoadOrStore(email, ipMap)
-		em := actual.(*emailIPMap)
-		em.mu.Lock()
-		if entry, exists := em.m[ip]; exists {
-			entry.lastSeen = now
-		} else if len(em.m) < deviceLimit {
-			em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
-		} else {
-			// 满额 + 新 IP → 拒绝新连接。原 LRU「踢最旧」挤占模式已停用,保留备查:
-			//   var oldestIP string
-			//   var oldestTime time.Time
-			//   first := true
-			//   for k, v := range em.m {
-			//       if first || v.lastSeen.Before(oldestTime) {
-			//           oldestIP = k
-			//           oldestTime = v.lastSeen
-			//           first = false
-			//       }
-			//   }
-			//   if oldestIP != "" {
-			//       delete(em.m, oldestIP)
-			//   }
-			//   em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
-			incrementKickCounter(email) // 累计"触发设备上限"次数(上报主控用于通知)
-			em.mu.Unlock()
-			return nil, false, true // 达到设备上限,拒绝新连接(dispatcher 会断流)
-		}
-		em.mu.Unlock()
-	} else {
-		// 无 device limit,仍要记 IP 给 online users 上报
-		ipMap := newEmailIPMap()
-		actual, _ := info.UserOnlineIP.LoadOrStore(email, ipMap)
-		em := actual.(*emailIPMap)
-		em.mu.Lock()
-		em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
-		em.mu.Unlock()
-	}
+	ipMap := newEmailIPMap()
+	actual, _ := info.UserOnlineIP.LoadOrStore(email, ipMap)
+	em := actual.(*emailIPMap)
+	em.mu.Lock()
+	em.m[ip] = &ipEntry{uid: uid, lastSeen: now}
+	em.mu.Unlock()
 
 	// Speed limit
 	limit := determineRate(nodeLimit, userLimit)
