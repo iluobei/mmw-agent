@@ -1559,6 +1559,31 @@ func (h *ManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, info)
 }
 
+// HandleSystemNICs 列出本机可用于 xray 出站 sendThrough 绑定的网卡地址。
+// 只返回地址本身,不含 MAC/路由等额外主机信息。
+func (h *ManageHandler) HandleSystemNICs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	nics, err := util.ListNICs()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "列举网卡失败: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"nics":    nics,
+	})
+}
+
 // ================== 配置文件管理 ==================
 
 // ConfigFileInfo 表示配置文件条目。

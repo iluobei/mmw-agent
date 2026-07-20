@@ -85,15 +85,17 @@ type Client struct {
 
 	// 伪装探针「真数据」采集状态(主控通过 config_update 下发开关 + ping 目标)。
 	// 只在总开关 + 各子开关开时采集对应项;probeMu 保护配置与最新 ping 结果。
-	probeMu          sync.Mutex
-	probeCollectCPU  bool
-	probeCollectMem  bool
-	probeCollectDisk bool
-	probeCollectPing bool
-	probePingTargets []ProbePingTarget
-	probePingIntMs   int                  // ping 间隔,默认 5000
-	probeLatestPing  []ProbeLatencySample // ping goroutine 写、traffic tick 读
-	probeSys         *sysMetricsCollector // CPU% 差分需跨采样状态,单个采集协程独占
+	probeMu               sync.Mutex
+	probeCollectCPU       bool
+	probeCollectMem       bool
+	probeCollectDisk      bool
+	probeCollectPing      bool
+	probePingTargets      []ProbePingTarget
+	probePingIntMs        int                  // ping 间隔,默认 5000
+	probeLatestPing       []ProbeLatencySample // ping goroutine 写、traffic tick 读
+	probeLatestPingAt     int64                // 最近一轮 ping 的采样时刻
+	probeLatestPingSentAt int64                // 已上报过的轮次时刻,用于去重(见 probeLatestPingSnapshot)
+	probeSys              *sysMetricsCollector // CPU% 差分需跨采样状态,单个采集协程独占
 
 	// 活跃的 traffic ticker 注册表,key 是 *time.Ticker。
 	// 4 处 runXxxLoop (WebSocket / HTTP / Pull / Pull+TrafficReport) 起 ticker 时 Store,defer Delete。
@@ -634,8 +636,8 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 		"public_ipv6":         publicIPv6,
 		"warp_installed":      warpInstalled,
 		"same_host_as_master": c.sameHostAsMaster(), // 主控同机 → 前端可显示「反代主控」入口
-		"agent_version":  version.Version, // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
-		"xray_mode":      c.config.XrayMode, // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
+		"agent_version":       version.Version,      // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
+		"xray_mode":           c.config.XrayMode,    // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
 		"capabilities": map[string]bool{
 			"rpc":    rpcAvailable,
 			"stream": rpcAvailable,
@@ -1404,7 +1406,7 @@ func (c *Client) sendSpeedHTTP(ctx context.Context) error {
 		return err
 	}
 
-	log.Printf("[Agent] Sent speed via HTTP: ↑%d B/s ↓%d B/s", uploadSpeed, downloadSpeed)
+	debugLogf("[Agent] Sent speed via HTTP: ↑%d B/s ↓%d B/s", uploadSpeed, downloadSpeed)
 	return nil
 }
 
@@ -1679,7 +1681,7 @@ func (c *Client) sendSpeedData(conn *websocket.Conn) error {
 		return err
 	}
 
-	log.Printf("[Agent] Sent speed data: ↑%d B/s ↓%d B/s", uploadSpeed, downloadSpeed)
+	debugLogf("[Agent] Sent speed data: ↑%d B/s ↓%d B/s", uploadSpeed, downloadSpeed)
 	return nil
 }
 
@@ -2499,8 +2501,9 @@ func (c *Client) handleProbeConfigUpdate(updates map[string]string) {
 			if ms < 2000 {
 				ms = 2000
 			}
-			if ms > 30000 {
-				ms = 30000
+			// 上限与主控 SetProbeDisguise 的校验保持一致(300s),否则管理员设的长间隔会被悄悄砍短。
+			if ms > 300000 {
+				ms = 300000
 			}
 			c.probePingIntMs = ms
 		}
@@ -2533,12 +2536,20 @@ func (c *Client) collectProbeSysMetrics() *ProbeSysMetrics {
 }
 
 // probeLatestPingSnapshot 读最近一轮 ping 结果(供 traffic tick 带走)。
+//
+// 同一轮结果只上报一次:traffic tick 是 5s 一次,ping 间隔默认更长,不去重的话
+// 同一份结果会被重复 ingest 十几次 —— 主控那边的 ring 会被重复点填满(有效窗口缩水),
+// 丢包率的分母也跟着虚增。
 func (c *Client) probeLatestPingSnapshot() []ProbeLatencySample {
 	c.probeMu.Lock()
 	defer c.probeMu.Unlock()
 	if !c.probeCollectPing || len(c.probeLatestPing) == 0 {
 		return nil
 	}
+	if c.probeLatestPingSentAt == c.probeLatestPingAt {
+		return nil // 这一轮已经报过了
+	}
+	c.probeLatestPingSentAt = c.probeLatestPingAt
 	out := make([]ProbeLatencySample, len(c.probeLatestPing))
 	copy(out, c.probeLatestPing)
 	return out
@@ -2568,6 +2579,9 @@ func (c *Client) runProbePingLoop() {
 			samples := probeRegions(targets)
 			c.probeMu.Lock()
 			c.probeLatestPing = samples
+			if len(samples) > 0 {
+				c.probeLatestPingAt = samples[0].At // 整轮同一个 At
+			}
 			c.probeMu.Unlock()
 		}
 	}

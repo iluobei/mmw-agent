@@ -20,6 +20,9 @@ const (
 	PathChildNginxConfig  = "/api/child/nginx/config"
 	PathChildNginxCfgFile = "/api/child/nginx/config-files"
 	PathChildSystemInfo   = "/api/child/system/info"
+	// PathChildSystemNICs 列出本机启用中的网卡地址,供主控在配置 xray 出站 sendThrough
+	// (多 IP 机器指定从哪个源 IP 出站)时给用户选。旧版 agent 无此路由,主控据此降级为手填。
+	PathChildSystemNICs = "/api/child/system/nics"
 	// PathChildLogs 让主控拉取本机日志:service=agent 读 agent 自身的日志文件(lumberjack),
 	// service=xray/nginx 走 journalctl。旧版 agent 无此路由,主控据此降级提示"版本过低"。
 	PathChildLogs = "/api/child/logs"

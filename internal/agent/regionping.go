@@ -15,6 +15,9 @@ type ProbePingTarget struct {
 	Key  string `json:"key"`
 	Host string `json:"host"`
 	Port int    `json:"port"`
+	// Type 是探测方式:"icmp" 走 ICMP echo,其余(含空)走 TCP connect。
+	// 空=tcp 是为了兼容老主控下发的目标(它不带这个字段)。
+	Type string `json:"type,omitempty"`
 }
 
 // ProbeLatencySample 是一次 ping 结果,上报给主控。
@@ -22,6 +25,11 @@ type ProbeLatencySample struct {
 	Key       string `json:"key"`
 	Success   bool   `json:"success"`
 	LatencyMs int64  `json:"latency_ms"`
+	// At 是**采样时刻**(unix 秒)。必须由 agent 打,不能让主控用收包时间代替:
+	// 上报是搭 traffic tick(5s)的车走的,与 ping 周期不同频,用收包时间会把
+	// 时间轴压缩成 5s 一格,ring 的有效覆盖窗口随之缩水。老 agent 不发这个字段,
+	// 主控侧对 0 值回落到接收时刻。
+	At int64 `json:"at,omitempty"`
 }
 
 const (
@@ -36,6 +44,7 @@ func probeRegions(targets []ProbePingTarget) []ProbeLatencySample {
 		targets = targets[:probePingMaxTargets]
 	}
 	out := make([]ProbeLatencySample, len(targets))
+	at := time.Now().Unix() // 一轮共用一个采样时刻,便于主控按 (key, at) 去重
 	sem := make(chan struct{}, probePingConcurrency)
 	var wg sync.WaitGroup
 	for i := range targets {
@@ -44,7 +53,9 @@ func probeRegions(targets []ProbePingTarget) []ProbeLatencySample {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out[idx] = pingOneTarget(targets[idx])
+			s := pingOneTarget(targets[idx])
+			s.At = at
+			out[idx] = s
 		}(i)
 	}
 	wg.Wait()
@@ -52,6 +63,16 @@ func probeRegions(targets []ProbePingTarget) []ProbeLatencySample {
 }
 
 func pingOneTarget(t ProbePingTarget) ProbeLatencySample {
+	// ICMP 目标:环境不支持(非 root 且 ping_group_range 没放开)时静默降级到 TCP,
+	// 而不是把这个目标标成失败 —— 那会让面板显示成"目标不通",误导排查方向。
+	if t.Type == "icmp" && icmpAvailable() {
+		rtt, err := icmpPing(t.Host, probePingTimeout)
+		if err != nil {
+			return ProbeLatencySample{Key: t.Key, Success: false}
+		}
+		return ProbeLatencySample{Key: t.Key, Success: true, LatencyMs: rtt.Milliseconds()}
+	}
+
 	port := t.Port
 	if port <= 0 {
 		port = 80
