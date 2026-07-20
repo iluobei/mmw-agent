@@ -83,6 +83,18 @@ type Client struct {
 	// 嵌入模式
 	embeddedXray *embedded.EmbeddedXray
 
+	// 伪装探针「真数据」采集状态(主控通过 config_update 下发开关 + ping 目标)。
+	// 只在总开关 + 各子开关开时采集对应项;probeMu 保护配置与最新 ping 结果。
+	probeMu          sync.Mutex
+	probeCollectCPU  bool
+	probeCollectMem  bool
+	probeCollectDisk bool
+	probeCollectPing bool
+	probePingTargets []ProbePingTarget
+	probePingIntMs   int                  // ping 间隔,默认 5000
+	probeLatestPing  []ProbeLatencySample // ping goroutine 写、traffic tick 读
+	probeSys         *sysMetricsCollector // CPU% 差分需跨采样状态,单个采集协程独占
+
 	// 活跃的 traffic ticker 注册表,key 是 *time.Ticker。
 	// 4 处 runXxxLoop (WebSocket / HTTP / Pull / Pull+TrafficReport) 起 ticker 时 Store,defer Delete。
 	// handleConfigUpdate 拿到新 interval 时遍历 Reset → 实现热重载,无需重连 / 重启。
@@ -125,6 +137,15 @@ type Client struct {
 	// nil = 未启用该特性 → 监听始终常开,行为同旧版。
 	onWSConnected    func()
 	onWSDisconnected func()
+
+	// onXrayAuthChange 由 main.go 注入:主控下发的许可证配额授权变化时调用(true=授权→确保 xray 运行,
+	// false=超额→停 xray)。Client 不直接持 ManageHandler 引用,故用回调解耦(仿 onWSConnected 范式)。
+	onXrayAuthChange func(authorized bool)
+}
+
+// SetXrayAuthHandler 注入「许可证配额授权变化 → 停/启 xray」回调。main.go 启动时调一次。
+func (c *Client) SetXrayAuthHandler(fn func(authorized bool)) {
+	c.onXrayAuthChange = fn
 }
 
 // SetListenGateHooks 注入"端口隐身"钩子(见 onWSConnected / onWSDisconnected 字段)。
@@ -154,6 +175,30 @@ func (c *Client) getPublicIPv6() string {
 	c.ipMu.RLock()
 	defer c.ipMu.RUnlock()
 	return c.publicIPv6
+}
+
+// sameHostAsMaster 判断主控是否与本 agent 同机 —— 「反代主控」的硬前提(proxy_pass 127.0.0.1 才通)。
+// 只做非阻塞判断:master_url host 是 localhost/127.0.0.1/::1,或等于本机已探测到的公网 IPv4/v6。
+// 不 resolve 域名(避免阻塞心跳);宿主机反代主控的推荐配置是 master_url=http://127.0.0.1:<port>。
+func (c *Client) sameHostAsMaster() bool {
+	u, err := url.Parse(c.config.MasterURL)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	switch strings.ToLower(host) {
+	case "":
+		return false
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	}
+	if v4 := c.getPublicIPv4(); v4 != "" && host == v4 {
+		return true
+	}
+	if v6 := c.getPublicIPv6(); v6 != "" && host == v6 {
+		return true
+	}
+	return false
 }
 
 // startIPProbeLoop 后台持续 detect 出口 v4 / v6,直到拿到才停。
@@ -295,6 +340,9 @@ func (c *Client) Start(ctx context.Context) {
 	// 后台 IP detect 循环 — 启动时立即跑一次,失败时 30s 重试,直到拿到 v4 / v6。
 	// 不阻塞 WS / HTTP / pull 模式的握手路径。
 	c.startIPProbeLoop(ctx)
+
+	// 伪装探针 ping 循环(独立于 traffic tick)。未开启 ping 时循环空转,开销可忽略。
+	go c.runProbePingLoop()
 
 	mode := ConnectionMode(c.config.ConnectionMode)
 
@@ -581,10 +629,11 @@ func (c *Client) authenticate(conn *websocket.Conn) error {
 		warpInstalled = c.warpStatusFn()
 	}
 	authPayload, _ := json.Marshal(map[string]any{
-		"token":          c.config.Token,
-		"public_ipv4":    publicIPv4,
-		"public_ipv6":    publicIPv6,
-		"warp_installed": warpInstalled,
+		"token":               c.config.Token,
+		"public_ipv4":         publicIPv4,
+		"public_ipv6":         publicIPv6,
+		"warp_installed":      warpInstalled,
+		"same_host_as_master": c.sameHostAsMaster(), // 主控同机 → 前端可显示「反代主控」入口
 		"agent_version":  version.Version, // 主控经 WS auth 直接拿版本,不再反向 HTTP 拉 /api/child/system/info(端口隐身后仍可显示)
 		"xray_mode":      c.config.XrayMode, // 上报当前运行模式,主控据此校正 embedded→external 漂移(license 恢复后自动拉回 embedded)
 		"capabilities": map[string]bool{
@@ -849,6 +898,17 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 	}
 	c.lastTrafficTime = now
 
+	// 伪装探针真数据:按开关采系统指标 + 带上最近一轮 ping 结果。全 omitempty 语义——
+	// 未开启任何项时不加字段,主控/旧主控都能安全忽略。
+	if c.probeAnyEnabled() {
+		if sm := c.collectProbeSysMetrics(); sm != nil {
+			payloadMap["sysmetrics"] = sm
+		}
+		if lat := c.probeLatestPingSnapshot(); len(lat) > 0 {
+			payloadMap["latency"] = lat
+		}
+	}
+
 	payload, _ := json.Marshal(payloadMap)
 
 	msg := map[string]interface{}{
@@ -860,7 +920,7 @@ func (c *Client) sendTrafficData(conn *websocket.Conn) error {
 		return err
 	}
 
-	log.Printf("[Agent] Sent traffic data: %d inbounds, %d outbounds, %d users",
+	debugLogf("[Agent] Sent traffic data: %d inbounds, %d outbounds, %d users",
 		len(stats.Inbound), len(stats.Outbound), len(stats.User))
 
 	return nil
@@ -877,12 +937,13 @@ func (c *Client) sendHeartbeat(conn *websocket.Conn) error {
 		warpInstalled = c.warpStatusFn()
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"boot_time":      c.startTime,
-		"listen_port":    listenPort,
-		"local_time":     time.Now().Unix(),
-		"public_ipv4":    publicIPv4,
-		"public_ipv6":    publicIPv6,
-		"warp_installed": warpInstalled,
+		"boot_time":           c.startTime,
+		"listen_port":         listenPort,
+		"local_time":          time.Now().Unix(),
+		"public_ipv4":         publicIPv4,
+		"public_ipv6":         publicIPv6,
+		"warp_installed":      warpInstalled,
+		"same_host_as_master": c.sameHostAsMaster(),
 	})
 
 	msg := map[string]interface{}{
@@ -1319,7 +1380,7 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 		c.handleConfigUpdate(respWrap.ConfigUpdates)
 	}
 
-	log.Printf("[Agent] Sent traffic data via HTTP: %d inbounds, %d outbounds, %d users",
+	debugLogf("[Agent] Sent traffic data via HTTP: %d inbounds, %d outbounds, %d users",
 		len(stats.Inbound), len(stats.Outbound), len(stats.User))
 	return nil
 }
@@ -2358,6 +2419,156 @@ func (c *Client) handleConfigUpdate(updates map[string]string) {
 				})
 				log.Printf("[Agent] traffic_report_interval updated to %v (reset %d active tickers)", d, resetCount)
 			}
+		}
+	}
+
+	// agent_log_enabled: 主控下发的 debug 日志总开关,控制流量上报等高频日志(默认关闭)。
+	// 不落盘(与探针配置同),重连时主控会重新下发当前值。
+	if raw, ok := updates["agent_log_enabled"]; ok {
+		setDebugLogEnabled(raw == "1" || strings.EqualFold(raw, "true"))
+	}
+
+	// xray_authorized: 主控按许可证「服务器配额」下发的运行授权。超额(0)→ 停 xray;拿到名额(1)→ 启 xray。
+	// 落盘以便重启时立即据此决定是否启动 xray。幂等:与当前值比对,变了才动作(避免 5min 定期兜底反复启停)。
+	// 当前值 nil(首次/未配置)视为已授权 true。
+	if raw, ok := updates["xray_authorized"]; ok {
+		authorized := raw == "1" || strings.EqualFold(raw, "true")
+		cur := true
+		if c.config.XrayAuthorized != nil {
+			cur = *c.config.XrayAuthorized
+		}
+		if authorized != cur {
+			c.config.XrayAuthorized = &authorized
+			if err := c.persistConfigField("xray_authorized", boolFlag(authorized)); err != nil {
+				log.Printf("[Agent] Failed to persist xray_authorized: %v", err)
+			} else {
+				log.Printf("[Agent] xray_authorized changed to %v (license quota)", authorized)
+			}
+			if c.onXrayAuthChange != nil {
+				c.onXrayAuthChange(authorized)
+			}
+		}
+	}
+
+	c.handleProbeConfigUpdate(updates)
+}
+
+// boolFlag 把 bool 转成配置持久化用的 "1"/"0"。
+func boolFlag(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+// handleProbeConfigUpdate 解析伪装探针采集配置(4 子开关 + ping 目标 + 间隔)。
+// 这些**不落盘**(规避 config.yaml 的 JSON 注入面),重连时主控会重新下发。
+func (c *Client) handleProbeConfigUpdate(updates map[string]string) {
+	_, hasCPU := updates["probe_collect_cpu"]
+	_, hasMem := updates["probe_collect_mem"]
+	_, hasDisk := updates["probe_collect_disk"]
+	_, hasPing := updates["probe_collect_ping"]
+	_, hasTargets := updates["probe_ping_targets"]
+	_, hasInterval := updates["probe_ping_interval_ms"]
+	if !hasCPU && !hasMem && !hasDisk && !hasPing && !hasTargets && !hasInterval {
+		return // 本次下发不含探针配置
+	}
+
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if hasCPU {
+		c.probeCollectCPU = updates["probe_collect_cpu"] == "1"
+	}
+	if hasMem {
+		c.probeCollectMem = updates["probe_collect_mem"] == "1"
+	}
+	if hasDisk {
+		c.probeCollectDisk = updates["probe_collect_disk"] == "1"
+	}
+	if hasPing {
+		c.probeCollectPing = updates["probe_collect_ping"] == "1"
+	}
+	if hasTargets {
+		var targets []ProbePingTarget
+		if json.Unmarshal([]byte(updates["probe_ping_targets"]), &targets) == nil {
+			c.probePingTargets = targets
+		}
+	}
+	if hasInterval {
+		if ms, err := strconv.Atoi(updates["probe_ping_interval_ms"]); err == nil {
+			if ms < 2000 {
+				ms = 2000
+			}
+			if ms > 30000 {
+				ms = 30000
+			}
+			c.probePingIntMs = ms
+		}
+	}
+	log.Printf("[Agent] probe config updated: cpu=%v mem=%v disk=%v ping=%v targets=%d",
+		c.probeCollectCPU, c.probeCollectMem, c.probeCollectDisk, c.probeCollectPing, len(c.probePingTargets))
+}
+
+// probeAnyEnabled 是否有任一采集项开启。
+func (c *Client) probeAnyEnabled() bool {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	return c.probeCollectCPU || c.probeCollectMem || c.probeCollectDisk || c.probeCollectPing
+}
+
+// collectProbeSysMetrics 按开关采一次系统指标(供 sendTrafficData 调)。无开启项返回 nil。
+func (c *Client) collectProbeSysMetrics() *ProbeSysMetrics {
+	c.probeMu.Lock()
+	cpu, mem, disk := c.probeCollectCPU, c.probeCollectMem, c.probeCollectDisk
+	if c.probeSys == nil {
+		c.probeSys = newSysMetricsCollector()
+	}
+	sc := c.probeSys
+	c.probeMu.Unlock()
+	if !cpu && !mem && !disk {
+		return nil
+	}
+	m := sc.sample(cpu, mem, disk)
+	return &m
+}
+
+// probeLatestPingSnapshot 读最近一轮 ping 结果(供 traffic tick 带走)。
+func (c *Client) probeLatestPingSnapshot() []ProbeLatencySample {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if !c.probeCollectPing || len(c.probeLatestPing) == 0 {
+		return nil
+	}
+	out := make([]ProbeLatencySample, len(c.probeLatestPing))
+	copy(out, c.probeLatestPing)
+	return out
+}
+
+// runProbePingLoop 独立 goroutine:按 probePingIntMs 周期性 ping 目标,结果写 probeLatestPing。
+// 与 traffic tick 解耦,避免每次 traffic tick 同步阻塞在 N 个 TCP 拨测上。
+func (c *Client) runProbePingLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.probeMu.Lock()
+			on := c.probeCollectPing
+			targets := c.probePingTargets
+			interval := c.probePingIntMs
+			c.probeMu.Unlock()
+			if interval >= 2000 {
+				ticker.Reset(time.Duration(interval) * time.Millisecond)
+			}
+			if !on || len(targets) == 0 {
+				continue
+			}
+			samples := probeRegions(targets)
+			c.probeMu.Lock()
+			c.probeLatestPing = samples
+			c.probeMu.Unlock()
 		}
 	}
 }

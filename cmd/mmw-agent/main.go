@@ -217,6 +217,7 @@ func main() {
 	// 创建处理器
 	manageHandler := handler.NewManageHandler(cfg.Token, cfg.RestartMethod, cfg.RestartCommand)
 	manageHandler.SetConfigPath(cfgFile)
+	manageHandler.SetLogPath(cfg.LogPath) // 供「Agent 日志」页读取 agent 自身日志文件
 	manageHandler.SetXrayMode(cfg.XrayMode)
 
 	// WARP 服务 — 状态文件 warp.json 跟 config.yaml 同目录(空 cfgFile 时用当前工作目录)
@@ -236,6 +237,14 @@ func main() {
 	// 同步那段在下面 embedded 分支里另起调用。
 	if cfg.XrayMode != "embedded" {
 		go ensureGeoData()
+	}
+
+	// 许可证配额授权:主控上次判定本机是否在服务器配额内。超额时主控下发 xray_authorized=0 并由 agent 落盘,
+	// 重启时据此决定是否拉起 xray(「重启立即检查」)。nil/未配置 = 首次或默认 → 授权先跑;
+	// 连上主控后由 handleConfigUpdate 的 xray_authorized 分支校正到最新值。
+	xrayAuthorized := cfg.XrayAuthorized == nil || *cfg.XrayAuthorized
+	if !xrayAuthorized {
+		log.Printf("[Main] 许可证配额:本机上次被主控判定为超额(xray_authorized=0),启动时不拉起 xray,等待主控重新授权")
 	}
 
 	// 嵌入模式：启动内嵌 Xray 实例
@@ -290,18 +299,29 @@ func main() {
 		// 启动自愈:给端口转发补齐 UDP + full-cone(修历史遗留的 tcp-only 入站 / freedom UseIP 出站)。
 		patchTunnelForwardUDPFullcone(configPath)
 
-		log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
-		embeddedXray = embedded.New(configPath)
-		if err := embeddedXray.Start(); err != nil {
-			log.Printf("[Main] Warning: embedded Xray failed to start (will retry via lazy-start): %v", err)
-			embeddedXray = nil
+		if !xrayAuthorized {
+			// 超额未授权:准备好配置但不启动 xray。留 embeddedXray=nil,待主控重新授权时
+			// 由 StartXray → lazyStartEmbeddedXray 拉起。embedded tunnel 模式下 nginx 接管 443。
+			log.Printf("[Main] 许可证配额未授权,跳过 embedded Xray 启动(配置已就绪)")
 		} else {
-			manageHandler.SetEmbeddedXray(embeddedXray)
+			log.Printf("[Main] Starting embedded Xray with config: %s", configPath)
+			embeddedXray = embedded.New(configPath)
+			if err := embeddedXray.Start(); err != nil {
+				log.Printf("[Main] Warning: embedded Xray failed to start (will retry via lazy-start): %v", err)
+				embeddedXray = nil
+			} else {
+				manageHandler.SetEmbeddedXray(embeddedXray)
+			}
 		}
 	}
 
 	// 外部模式：启动时自动检测并补全 xray 配置
-	if embeddedXray == nil {
+	if embeddedXray == nil && !xrayAuthorized {
+		// 超额未授权(external 模式,或 embedded 未授权跳过启动):停掉 xray,等待主控重新授权。
+		// tunnel 模式下 StopXray 会先让 nginx 接管 443。
+		log.Printf("[Main] 许可证配额未授权,停止 xray 服务")
+		manageHandler.StopXray()
+	} else if embeddedXray == nil {
 		log.Printf("[Main] Running startup xray auto-detection...")
 		result := manageHandler.EnsureXrayConfig()
 		if result.Modified {
@@ -332,6 +352,19 @@ func main() {
 	agentClient.SetWarpStatusFn(warpService.IsInstalled)
 	manageHandler.OnEmbeddedXrayStart(func(ex *embedded.EmbeddedXray) {
 		agentClient.SetEmbeddedXray(ex)
+	})
+	// 注入许可证配额授权回调:主控下发 xray_authorized 变化时,授权→启 xray、超额→停 xray。
+	// 复用 ManageHandler 的 StopXray/StartXray(含 embedded/external + tunnel 模式 nginx 443 让路)。
+	agentClient.SetXrayAuthHandler(func(authorized bool) {
+		if authorized {
+			log.Printf("[Main] 许可证配额:已授权,启动 xray")
+			if err := manageHandler.StartXray(); err != nil {
+				log.Printf("[Main] 许可证配额授权后启动 xray 失败: %v", err)
+			}
+		} else {
+			log.Printf("[Main] 许可证配额:超额,停止 xray")
+			manageHandler.StopXray()
+		}
 	})
 	// lazyStartEmbeddedXray 可能在回调注册前已经执行（EnsureXrayConfig 触发），补偿传递
 	if ex := manageHandler.GetEmbeddedXray(); ex != nil && embeddedXray == nil {

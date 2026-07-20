@@ -50,7 +50,12 @@ type ManageHandler struct {
 	// 2) 主控旧 GET→remove+add 路径下相互覆盖丢 client。
 	// 配置文件只有一份,锁不需要 per-inbound 粒度,直接 handler 全局即可。
 	inboundsMu sync.Mutex
+	// logPath 是 agent 自身日志文件路径(lumberjack),由 main.go 注入。HandleGetLogs 读它。
+	logPath string
 }
+
+// SetLogPath 注入 agent 自身日志文件路径,供 HandleGetLogs 读取。
+func (h *ManageHandler) SetLogPath(p string) { h.logPath = p }
 
 // 创建管理处理器。
 func NewManageHandler(configToken, restartMethod, restartCommand string) *ManageHandler {
@@ -97,6 +102,38 @@ func (h *ManageHandler) RestartXray() error {
 		return h.lazyStartEmbeddedXray()
 	}
 	return xrayctl.RestartXray(h.restartMethod, h.restartCommand)
+}
+
+// StopXray 停止 xray:tunnel 模式先恢复 nginx 443 fallback 再停,让 nginx 接管 443。
+// 与 HandleServiceControl 的 stop 分支同源逻辑,供许可证配额授权回调(超额停机)复用。
+func (h *ManageHandler) StopXray() {
+	if h.configNeedsPort443() {
+		h.deployFallback443()
+		h.reloadNginx()
+	}
+	if h.embeddedXray != nil {
+		h.embeddedXray.Stop()
+	} else {
+		exec.Command("systemctl", "stop", "xray").Run()
+	}
+}
+
+// StartXray 启动 xray:tunnel 模式先移除 nginx 443 fallback 释放端口再启,失败则回滚 fallback。
+// 与 HandleServiceControl 的 start 分支同源逻辑,供许可证配额授权回调(拿到名额启机)复用。
+func (h *ManageHandler) StartXray() error {
+	if h.configNeedsPort443() {
+		h.removeFallback443()
+		h.reloadNginx()
+		time.Sleep(300 * time.Millisecond)
+	}
+	if err := h.RestartXray(); err != nil {
+		if h.configNeedsPort443() {
+			h.deployFallback443()
+			h.reloadNginx()
+		}
+		return err
+	}
+	return nil
 }
 
 // restartEmbeddedXray 重启已有的 embedded xray，处理 tunnel 模式端口冲突。
@@ -1340,6 +1377,138 @@ func (h *ManageHandler) setNginxConfig(w http.ResponseWriter, r *http.Request) {
 // ================== 系统信息 ==================
 
 // 处理 GET /api/child/system/info。
+// logServiceUnits 是 journalctl 允许查询的 systemd unit 白名单。
+// 入参永远不进 exec —— service 名先在此映射,映射不到直接拒绝,杜绝任意 unit 查询/命令注入。
+var logServiceUnits = map[string]string{
+	"xray":  "xray",
+	"nginx": "nginx",
+}
+
+// HandleGetLogs 返回本机最近 N 行日志,供主控「Agent 日志」页展示。
+//
+//	service=agent → 读 agent 自身的日志文件(lumberjack,h.logPath)。这条路 systemd 与 Docker
+//	               部署都通,因为 agent 早已 log.SetOutput 到文件(见 cmd/mmw-agent 的 setupLogging)。
+//	service=xray/nginx → journalctl -u <unit>(白名单)。Docker 部署无 systemd → 返回明确提示。
+func (h *ManageHandler) HandleGetLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		return
+	}
+	if !h.authenticate(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	service := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("service")))
+	if service == "" {
+		service = "agent"
+	}
+	lines := 200
+	if v := r.URL.Query().Get("lines"); v != "" {
+		if n := parseIntClamp(v, 1, 2000); n > 0 {
+			lines = n
+		}
+	}
+
+	var content string
+	switch service {
+	case "agent":
+		path := h.logPath
+		if path == "" {
+			writeError(w, http.StatusInternalServerError, "agent log path not configured")
+			return
+		}
+		out, err := tailLogFile(path, lines)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("read agent log: %v", err))
+			return
+		}
+		content = out
+	case "xray", "nginx":
+		unit := logServiceUnits[service] // 白名单,入参不进 exec
+		out, err := exec.Command("journalctl", "-u", unit, "-n", fmt.Sprintf("%d", lines), "--no-pager", "-o", "cat").CombinedOutput()
+		if err != nil {
+			// 容器内无 systemd → journalctl 不存在/失败 → 明确提示,而非一个看不懂的错误
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("journalctl 不可用(Docker 部署无 systemd?): %v", err),
+				"logs":    strings.TrimSpace(string(out)),
+			})
+			return
+		}
+		content = strings.TrimSpace(string(out))
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported service (agent/xray/nginx)")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"service": service,
+		"logs":    content,
+	})
+}
+
+// parseIntClamp 解析并夹在 [lo,hi];失败返回 0。
+func parseIntClamp(s string, lo, hi int) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+		if n > hi {
+			return hi
+		}
+	}
+	if n < lo {
+		return 0
+	}
+	return n
+}
+
+// tailLogFile 返回文件最后 n 行(反向 8KB 分块,与主控 tailFile 同思路)。
+func tailLogFile(path string, n int) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	const chunk = 8192
+	size := stat.Size()
+	if size == 0 {
+		return "", nil
+	}
+	var buf []byte
+	off := size
+	nl := 0
+	for off > 0 && nl <= n {
+		rd := int64(chunk)
+		if rd > off {
+			rd = off
+		}
+		off -= rd
+		b := make([]byte, rd)
+		if _, err := f.ReadAt(b, off); err != nil && err != io.EOF {
+			return "", err
+		}
+		buf = append(b, buf...)
+		nl = bytes.Count(buf, []byte{'\n'})
+	}
+	for len(buf) > 0 && buf[len(buf)-1] == '\n' {
+		buf = buf[:len(buf)-1]
+	}
+	lines := bytes.Split(buf, []byte{'\n'})
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return string(bytes.Join(lines, []byte{'\n'})), nil
+}
+
 func (h *ManageHandler) HandleSystemInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
@@ -2998,23 +3167,30 @@ func (h *ManageHandler) manageOutbound(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		obArr, _ := config["outbounds"].([]interface{})
-		// tag → outbound 索引(原数组里的)
-		idxByTag := make(map[string]int, len(obArr))
+		// tag → 该 tag 的所有原始索引(队列)。tag 可能重复(如多个 warp-v4),用队列按出现顺序消费,
+		// 才能正确重排;旧实现 map[string]int 只留最后一个,重复 tag 会串位/丢位。
+		indicesByTag := make(map[string][]int, len(obArr))
 		for i, ob := range obArr {
 			m, ok := ob.(map[string]interface{})
 			if !ok {
 				continue
 			}
 			if tag, _ := m["tag"].(string); tag != "" {
-				idxByTag[tag] = i
+				indicesByTag[tag] = append(indicesByTag[tag], i)
 			}
 		}
 		used := make(map[int]bool, len(obArr))
 		reordered := make([]interface{}, 0, len(obArr))
 		for _, tag := range req.Tags {
-			if i, ok := idxByTag[tag]; ok && !used[i] {
-				reordered = append(reordered, obArr[i])
-				used[i] = true
+			// 取该 tag 队列里第一个未用的索引(重复 tag 按 req.Tags 出现顺序依次对应)
+			for len(indicesByTag[tag]) > 0 {
+				i := indicesByTag[tag][0]
+				indicesByTag[tag] = indicesByTag[tag][1:]
+				if !used[i] {
+					reordered = append(reordered, obArr[i])
+					used[i] = true
+					break
+				}
 			}
 		}
 		// 保留未在 tags 中的 outbound,按原相对顺序追加
@@ -5720,13 +5896,14 @@ func (h *ManageHandler) ensureExternalXray() error {
 	return nil
 }
 
-// ClassifyRulePriority 把单条 routing rule 按 marktag/outboundTag 归类成 5 个优先级,数字越小越靠前:
+// ClassifyRulePriority 把单条 routing rule 按 marktag/outboundTag 归类成优先级,数字越小越靠前:
 //
-//	0 - 端口转发(outboundTag 以 "tunnel-" 开头),xray 按序匹配,必须置顶以免被下游 routed/warp/api 截胡
-//	1 - user 私有 routed 出站(marktag = "routed:<shortID>:u<username>:<labelSlug>",4 段)
-//	2 - admin 共享 routed 出站(marktag = "routed:<shortID>:<labelSlug>",3 段)
-//	3 - 家宽常用 / 测速分流 两个快捷预设(marktag 白名单匹配)
-//	4 - 其他规则(空 marktag、自定义、ban_bt / fix_openai / warp_anti_china 等)
+//	-1 - 偷自己伪装站回落(outboundTag = "nginx",tunnel-in + domain → nginx),必须置于最前
+//	 0 - 端口转发(outboundTag 以 "tunnel-" 开头),xray 按序匹配,必须置顶以免被下游 routed/warp/api 截胡
+//	 1 - user 私有 routed 出站(marktag = "routed:<shortID>:u<username>:<labelSlug>",4 段)
+//	 2 - admin 共享 routed 出站(marktag = "routed:<shortID>:<labelSlug>",3 段)
+//	 3 - 家宽常用 / 测速分流 两个快捷预设(marktag 白名单匹配)
+//	 4 - 其他规则(空 marktag、自定义、ban_bt / fix_openai / warp_anti_china 等,含 tunnel-in→direct catch-all)
 //
 // 段数判断稳:simpleSlug 把非 [a-z0-9-] 全换成 -,labelSlug 不含冒号,所以
 // "routed:" 前缀 + ":" 段数 = 3 或 4 可唯一区分 admin vs user。
@@ -5734,9 +5911,17 @@ func (h *ManageHandler) ensureExternalXray() error {
 // outboundTag = "tunnel-*" 是 miaomiaowuX 端口转发的命名约定(见前端 inbound-wizard generateTunnelTag),
 // 单独提到 priority 0 是因为 xray routing 按数组顺序短路匹配,这类规则若被 routed/warp 截胡,
 // 端口转发的语义就丢了。注意 "tunnel-in" 是 inboundTag(伪装入站),不会出现在 outboundTag,排除安全。
+//
+// nginx 回落规则给 -1(最前):它是 tunnel-in 入站上按 domain 命中的伪装站回落。default 模板里
+// tunnel-in→direct catch-all(无 domain,priority 4)排在前面,若 nginx 规则被 mergeRouting append 到
+// 其后,xray 短路匹配会让伪装域名永远走 direct → nginx 规则失效。置于最前既保证功能,又与主控
+// addWebsiteTunnelConfig 的 prepend-to-head 落点一致 → 重启后 config 字节不变、不再误报「配置漂移」。
 func ClassifyRulePriority(rule map[string]interface{}) int {
 	if rule == nil {
 		return 4
+	}
+	if outboundTag, _ := rule["outboundTag"].(string); outboundTag == "nginx" {
+		return -1
 	}
 	if outboundTag, _ := rule["outboundTag"].(string); strings.HasPrefix(outboundTag, "tunnel-") {
 		return 0

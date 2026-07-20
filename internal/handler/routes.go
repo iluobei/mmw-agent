@@ -27,6 +27,7 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildNginxConfig, manageHandler.HandleNginxConfig)
 	mux.HandleFunc(constants.PathChildNginxCfgFile, manageHandler.HandleNginxConfigFiles)
 	mux.HandleFunc(constants.PathChildSystemInfo, manageHandler.HandleSystemInfo)
+	mux.HandleFunc(constants.PathChildLogs, manageHandler.HandleGetLogs)
 	mux.HandleFunc(constants.PathChildInbounds, manageHandler.HandleInbounds)
 	mux.HandleFunc(constants.PathChildOutbounds, manageHandler.HandleOutbounds)
 	mux.HandleFunc(constants.PathChildRouting, manageHandler.HandleRouting)

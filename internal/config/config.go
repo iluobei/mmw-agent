@@ -31,6 +31,10 @@ type Config struct {
 	// HidePortOnWS 开启时:WS 连接可用期间关闭入站监听端口(隐藏 agent),WS 断开时立即重开以保证
 	// 主控 HTTP/pull 回退可达。*bool 区分"未配置"(默认 true)与显式 false。
 	HidePortOnWS *bool `yaml:"hide_port_on_ws"`
+	// XrayAuthorized 是主控按许可证「服务器配额」下发的运行授权:超出配额的服务器为 false → agent 停 xray。
+	// 主控通过 config_update 下发并由 agent 落盘,重启时据此决定是否启动 xray(实现「重启立即检查」)。
+	// *bool 区分"未配置/首次启动"(nil = 默认授权,先跑)与主控显式判定的 true/false。
+	XrayAuthorized *bool `yaml:"xray_authorized"`
 }
 
 // DefaultLogPath 是 agent 日志文件默认路径（lumberjack 在同目录轮转生成备份）。

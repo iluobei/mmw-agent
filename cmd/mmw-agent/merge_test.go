@@ -122,6 +122,75 @@ func TestMergeXrayConfig_PreservesUserInboundsAndOutbounds(t *testing.T) {
 	}
 }
 
+// 回归:偷自己部署 nginx 网站后往 routing 加的 `tunnel-in + domain → nginx` 回落规则,
+// 主控 prepend 到数组头部。agent 进程重启走 mergeXrayConfig/mergeRouting 时,这条 existing-only
+// 规则必须仍排在 default 模板的 `tunnel-in → direct` catch-all 之前(否则 xray 短路匹配让伪装域名
+// 永远走 direct → nginx 规则失效),且落在头部 —— 与主控落点一致,才不会被误报「配置漂移」。
+func TestMergeXrayConfig_NginxFallbackRuleStaysBeforeCatchAll(t *testing.T) {
+	// existing:主控部署 nginx 后的配置 —— nginx 规则在头部,后面才是 tunnel-in→direct catch-all
+	existing := `{
+		"inbounds": [{"tag": "tunnel-in", "port": 443, "protocol": "tunnel"}],
+		"outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "nginx", "protocol": "freedom"}],
+		"routing": {
+			"rules": [
+				{"type":"field","inboundTag":["tunnel-in"],"domain":["disguise.example.com"],"outboundTag":"nginx"},
+				{"inboundTag":["tunnel-in"],"outboundTag":"direct"}
+			]
+		}
+	}`
+	// template:default 配置 —— catch-all tunnel-in→direct 在最前
+	template := `{
+		"inbounds": [{"tag": "tunnel-in", "port": 443, "protocol": "tunnel"}],
+		"outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "nginx", "protocol": "freedom"}],
+		"routing": {
+			"rules": [
+				{"inboundTag":["tunnel-in"],"outboundTag":"direct"},
+				{"type":"field","inboundTag":["api"],"outboundTag":"api"}
+			]
+		}
+	}`
+
+	merged, err := mergeXrayConfig([]byte(existing), []byte(template))
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(merged, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	rules := m["routing"].(map[string]any)["rules"].([]any)
+
+	nginxIdx, catchAllIdx := -1, -1
+	for i, r := range rules {
+		rm, _ := r.(map[string]any)
+		out, _ := rm["outboundTag"].(string)
+		if out == "nginx" {
+			nginxIdx = i
+		}
+		if out == "direct" {
+			if in, _ := rm["inboundTag"].([]any); len(in) == 1 {
+				if s, _ := in[0].(string); s == "tunnel-in" {
+					if _, hasDomain := rm["domain"]; !hasDomain {
+						catchAllIdx = i
+					}
+				}
+			}
+		}
+	}
+	if nginxIdx == -1 {
+		t.Fatal("nginx fallback rule lost after merge")
+	}
+	if catchAllIdx == -1 {
+		t.Fatal("tunnel-in→direct catch-all lost after merge")
+	}
+	if nginxIdx >= catchAllIdx {
+		t.Fatalf("nginx rule (idx %d) must come before tunnel-in→direct catch-all (idx %d) — otherwise xray short-circuits to direct and the disguise site breaks", nginxIdx, catchAllIdx)
+	}
+	if nginxIdx != 0 {
+		t.Fatalf("nginx rule should sort to head (idx 0) to match master's prepend, got idx %d", nginxIdx)
+	}
+}
+
 func TestMergeXrayConfig_TemplateInboundReplacesSameTag(t *testing.T) {
 	existing := `{"inbounds":[{"tag":"api","port":1234}],"outbounds":[]}`
 	template := `{"inbounds":[{"tag":"api","port":46736}],"outbounds":[]}`

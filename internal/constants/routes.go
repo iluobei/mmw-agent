@@ -20,6 +20,9 @@ const (
 	PathChildNginxConfig  = "/api/child/nginx/config"
 	PathChildNginxCfgFile = "/api/child/nginx/config-files"
 	PathChildSystemInfo   = "/api/child/system/info"
+	// PathChildLogs 让主控拉取本机日志:service=agent 读 agent 自身的日志文件(lumberjack),
+	// service=xray/nginx 走 journalctl。旧版 agent 无此路由,主控据此降级提示"版本过低"。
+	PathChildLogs = "/api/child/logs"
 	PathChildInbounds     = "/api/child/inbounds"
 	PathChildOutbounds    = "/api/child/outbounds"
 	PathChildRouting      = "/api/child/routing"
