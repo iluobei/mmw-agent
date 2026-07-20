@@ -3,4 +3,4 @@
 // 主控通过 /api/child/system-info 拿到这个值与 GitHub latest tag 比对,触发升级提示。
 package version
 
-const Version = "0.3.7"
+const Version = "0.3.8"
