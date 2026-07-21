@@ -49,6 +49,9 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.3.10 (2026-07-21)
+- 🌈 支持xray日志查看
+
 ### v0.3.8 (2026-07-20)
 - 🌈增加系统信息上报
 
