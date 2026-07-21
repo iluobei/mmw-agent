@@ -1360,6 +1360,19 @@ func (c *Client) sendTrafficHTTP(ctx context.Context) error {
 			"boot_time_unix": c.startTime.Unix(),
 		},
 	}
+
+	// 伪装探针真数据:与 sendTrafficData(WS 路径)完全一致。
+	// 这段之前只写在 WS 路径里,HTTP/pull 模式的服务器在伪装页上就只剩流量和网速,
+	// CPU/内存/硬盘/延迟全缺 —— 主控那边的 ring 根本收不到数据。
+	if c.probeAnyEnabled() {
+		if sm := c.collectProbeSysMetrics(); sm != nil {
+			payloadMap["sysmetrics"] = sm
+		}
+		if lat := c.probeLatestPingSnapshot(); len(lat) > 0 {
+			payloadMap["latency"] = lat
+		}
+	}
+
 	payload, _ := json.Marshal(payloadMap)
 
 	u, err := url.Parse(c.config.MasterURL)
@@ -2116,7 +2129,9 @@ func (c *Client) handleLimiterConfig(payload WSLimiterConfigPayload) {
 		return
 	}
 
-	l.AddInboundLimiter(payload.InboundTag, payload.NodeLimit, users)
+	// 用 Sync 而非 Add:Add 会重建 BucketHub,存量连接持有的旧桶不会被更新,
+	// 改限速对已连上的用户不生效(要等他重连)。见 SyncInboundLimiter 的说明。
+	l.SyncInboundLimiter(payload.InboundTag, payload.NodeLimit, users)
 
 	if monitor := c.embeddedXray.GetSpeedMonitor(); monitor != nil {
 		monitor.SetLimiter(l)

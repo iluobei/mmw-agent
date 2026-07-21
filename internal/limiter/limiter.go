@@ -156,6 +156,56 @@ func (l *Limiter) AddInboundLimiter(tag string, nodeSpeedLimit uint64, users []U
 	l.InboundInfo.Store(tag, info)
 }
 
+// SyncInboundLimiter 用主控下发的最新配置整体刷新一个 inbound 的限速。
+//
+// 与 AddInboundLimiter 的关键区别:**沿用原有的 BucketHub 和 UserOnlineIP**。
+//
+// 为什么必须沿用:dispatcher 只在连接建立时调一次 GetUserBucket,把拿到的
+// *rate.Limiter 包进 RateWriter 伴随该连接终生(见 dispatcher/default.go)。
+// 换掉 BucketHub 之后,存量连接手里仍是旧桶对象 —— 改了限速对已经连上的人
+// 完全不生效,只有新建连接才拿到新值。线上表现就是"配置后过一阵才生效、
+// 客户端重连一下就生效了"。
+//
+// UserOnlineIP 同理:重建会把在线设备统计清零,而限速下发在每次 WS 重连时
+// 都会发生,等于设备数统计被反复清空。
+func (l *Limiter) SyncInboundLimiter(tag string, nodeSpeedLimit uint64, users []UserInfo) {
+	old, ok := l.InboundInfo.Load(tag)
+	if !ok {
+		l.AddInboundLimiter(tag, nodeSpeedLimit, users)
+		return
+	}
+	prev := old.(*InboundInfo)
+
+	// 仍然整体换 InboundInfo 而不是原地改 NodeSpeedLimit:后者会与 GetUserBucket
+	// 的无锁读构成数据竞争。换指针由 sync.Map.Store 保证可见性。
+	info := &InboundInfo{
+		Tag:            tag,
+		NodeSpeedLimit: nodeSpeedLimit,
+		UserInfo:       new(sync.Map),
+		BucketHub:      prev.BucketHub,
+		UserOnlineIP:   prev.UserOnlineIP,
+	}
+	for _, u := range users {
+		info.UserInfo.Store(fmt.Sprintf("%s|%s|%d", tag, u.Email, u.UID), u)
+	}
+	l.InboundInfo.Store(tag, info)
+
+	// 把新速率写进存量桶,存量连接立刻感知。
+	// limit==0(无限制)不动:同 UpdateInboundLimiter 的说明 —— 删桶或原地置无限
+	// 都会破坏正在生效的自动限速。空闲桶由 GetOnlineUsers 统一回收。
+	for _, u := range users {
+		limit := determineRate(nodeSpeedLimit, u.SpeedLimit)
+		if limit <= 0 {
+			continue
+		}
+		if bucket, ok := info.BucketHub.Load(u.Email); ok {
+			b := bucket.(*rate.Limiter)
+			b.SetLimit(rate.Limit(limit))
+			b.SetBurst(calcBurst(limit))
+		}
+	}
+}
+
 func (l *Limiter) UpdateInboundLimiter(tag string, users []UserInfo) {
 	value, ok := l.InboundInfo.Load(tag)
 	if !ok {
