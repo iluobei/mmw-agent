@@ -52,10 +52,16 @@ type ManageHandler struct {
 	inboundsMu sync.Mutex
 	// logPath 是 agent 自身日志文件路径(lumberjack),由 main.go 注入。HandleGetLogs 读它。
 	logPath string
+	// xrayAccessLogPath 是内嵌 xray 的 access log 文件(见 config.XrayAccessLogPathFor)。
+	// 内嵌模式下 service=xray 读它,而不是查 journalctl -u xray(那个 unit 不存在)。
+	xrayAccessLogPath string
 }
 
 // SetLogPath 注入 agent 自身日志文件路径,供 HandleGetLogs 读取。
 func (h *ManageHandler) SetLogPath(p string) { h.logPath = p }
+
+// SetXrayAccessLogPath 注入内嵌 xray 的 access log 文件路径。
+func (h *ManageHandler) SetXrayAccessLogPath(p string) { h.xrayAccessLogPath = p }
 
 // 创建管理处理器。
 func NewManageHandler(configToken, restartMethod, restartCommand string) *ManageHandler {
@@ -1425,6 +1431,30 @@ func (h *ManageHandler) HandleGetLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		content = out
 	case "xray", "nginx":
+		// 内嵌模式下 xray 跑在 agent 进程内,没有独立 systemd unit,access log 落在
+		// xrayAccessLogPath 文件里(见 embedded.AccessLogPath)。查 journalctl -u xray
+		// 只会得到空 —— 那个 unit 不存在。故内嵌模式直接读文件。
+		if service == "xray" && h.xrayMode == "embedded" {
+			if h.xrayAccessLogPath == "" {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"success": false,
+					"message": "内嵌 xray access log 路径未配置",
+					"logs":    "",
+				})
+				return
+			}
+			out, err := tailLogFile(h.xrayAccessLogPath, lines)
+			if err != nil {
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("读取 xray access log 失败(可能还没有连接产生日志): %v", err),
+					"logs":    "",
+				})
+				return
+			}
+			content = out
+			break
+		}
 		unit := logServiceUnits[service] // 白名单,入参不进 exec
 		out, err := exec.Command("journalctl", "-u", unit, "-n", fmt.Sprintf("%d", lines), "--no-pager", "-o", "cat").CombinedOutput()
 		if err != nil {

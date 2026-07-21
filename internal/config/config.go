@@ -3,6 +3,7 @@ package config
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"mmw-agent/internal/constants"
@@ -39,6 +40,19 @@ type Config struct {
 
 // DefaultLogPath 是 agent 日志文件默认路径（lumberjack 在同目录轮转生成备份）。
 const DefaultLogPath = "/var/log/mmw-agent/mmw-agent.log"
+
+// XrayAccessLogPathFor 返回内嵌 xray 的 access log 路径,与 agent 日志同目录。
+//
+// 为什么要独立文件:内嵌模式下 xray access log 默认直写进程 stdout,被 systemd 收进
+// mmw-agent unit —— 面板「查看 xray 日志」查的是 journalctl -u xray(不存在的 unit),
+// 所以看不到连接日志。改让 xray 把 access log 落这个文件,面板直接读它,不依赖 systemd,
+// Docker 部署也能读。轮转由 agent 侧 copytruncate 负责(xray 用 O_APPEND,truncate 后无空洞)。
+func XrayAccessLogPathFor(agentLogPath string) string {
+	if agentLogPath == "" {
+		agentLogPath = DefaultLogPath
+	}
+	return filepath.Join(filepath.Dir(agentLogPath), "xray-access.log")
+}
 
 // XrayServer 表示本机 Xray 节点配置。
 type XrayServer struct {

@@ -59,6 +59,50 @@ func setupLogging(logPath string) {
 	go cleanupLogsLoop(filepath.Dir(logPath))
 }
 
+// xrayAccessLogRotateLoop 用 copytruncate 方式给内嵌 xray 的 access log 做轮转。
+//
+// 为什么是 copytruncate 而不是 lumberjack:xray 内嵌运行时自己持有 access log 的文件句柄,
+// rename+新建那套(lumberjack)会让 xray 继续写旧 inode,新文件永远是空的。
+// xray 用 O_APPEND 打开(见 fork common/log/logger.go),所以 truncate 到 0 后,
+// 下一次写会落在新的 EOF(0),不产生空洞 —— 这正是 logrotate 的 copytruncate 模式。
+//
+// 策略:超过 50MB 时,把当前内容留最后一半到 .1 备份,再清空主文件。这样磁盘占用有界,
+// 且截断瞬间丢失的日志窗口很小(access log 是高频流水,丢一点尾部无碍排查)。
+func xrayAccessLogRotateLoop(path string) {
+	const maxBytes = 50 << 20 // 50MB
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		fi, err := os.Stat(path)
+		if err != nil || fi.Size() < maxBytes {
+			continue
+		}
+		// 保留最后一半到 .1,便于轮转后还能翻到近期日志。
+		if data, err := os.ReadFile(path); err == nil {
+			half := data[len(data)/2:]
+			// 从第一个换行开始,避免备份文件以半行开头。
+			if i := indexByte(half, '\n'); i >= 0 && i+1 < len(half) {
+				half = half[i+1:]
+			}
+			_ = os.WriteFile(path+".1", half, 0o600)
+		}
+		// O_APPEND 写者在 truncate 后从新 EOF(0)继续,不产生空洞。
+		if err := os.Truncate(path, 0); err != nil {
+			log.Printf("[Main] xray access log 轮转失败: %v", err)
+		}
+	}
+}
+
+// indexByte 是 bytes.IndexByte 的本地别名,避免为一处引入 bytes import。
+func indexByte(b []byte, c byte) int {
+	for i := range b {
+		if b[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
 // setupMemoryLimit 给进程设内存软上限(GOMEMLIMIT 等价),让 GC 在接近上限时更激进回收。
 // 优先级:用户已设的 GOMEMLIMIT > MMWX_LOG... 不,> MMWX_MEM_LIMIT_MB > embedded 模式按系统内存 75% 自动设。
 // external 模式 agent 内存很小,不自动设(避免无谓的 GC 压力)。
@@ -203,6 +247,14 @@ func main() {
 	// 日志真实落地到文件 + 保留 stdout(供 systemd journald / 容器查看)。
 	setupLogging(cfg.LogPath)
 
+	// 内嵌模式:让 xray 把 access log 落独立文件(而非直写 stdout 进 mmw-agent unit),
+	// 面板「查看 xray 日志」才读得到连接日志。轮转由下方 xrayAccessLogRotateLoop 负责。
+	xrayAccessLog := config.XrayAccessLogPathFor(cfg.LogPath)
+	if cfg.XrayMode == "embedded" {
+		embedded.AccessLogPath = xrayAccessLog
+		go xrayAccessLogRotateLoop(xrayAccessLog)
+	}
+
 	// embedded 模式 agent 内联 xray 承载所有代理连接,设内存软上限让 GC 更早回收、抑制 RSS 暴涨。
 	setupMemoryLimit(cfg.XrayMode == "embedded")
 
@@ -219,6 +271,7 @@ func main() {
 	manageHandler.SetConfigPath(cfgFile)
 	manageHandler.SetLogPath(cfg.LogPath) // 供「Agent 日志」页读取 agent 自身日志文件
 	manageHandler.SetXrayMode(cfg.XrayMode)
+	manageHandler.SetXrayAccessLogPath(xrayAccessLog) // 内嵌模式 service=xray 读它
 
 	// WARP 服务 — 状态文件 warp.json 跟 config.yaml 同目录(空 cfgFile 时用当前工作目录)
 	warpWorkDir := "."

@@ -2,6 +2,7 @@ package embedded
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 
 	officialstats "github.com/xtls/xray-core/app/stats"
@@ -27,11 +28,43 @@ func TestConfigJSON(jsonData []byte) error {
 	return err
 }
 
+// AccessLogPath 非空时,buildCoreConfig 会把内嵌 xray 的 access log 强制落到这个文件
+// (覆盖下发配置里的 log.access)。由 main 按 agent 日志目录设置。
+//
+// 目的:内嵌模式下 access log 默认直写 stdout,面板「查看 xray 日志」查 journalctl -u xray
+// (不存在的 unit)看不到。落文件后面板直接读它,不依赖 systemd。
+var AccessLogPath string
+
+// injectAccessLog 把 log.access 覆盖为 AccessLogPath。只动 access,不碰 loglevel ——
+// access log(accepted/rejected)在 xray 里独立于 loglevel,用户设 error 也照打。
+// 解析失败一律返回原始 data,绝不因为这个可选特性阻断 xray 启动。
+func injectAccessLog(data []byte) []byte {
+	if AccessLogPath == "" {
+		return data
+	}
+	var m map[string]any
+	if json.Unmarshal(data, &m) != nil {
+		return data
+	}
+	logCfg, _ := m["log"].(map[string]any)
+	if logCfg == nil {
+		logCfg = map[string]any{}
+		m["log"] = logCfg
+	}
+	logCfg["access"] = AccessLogPath
+	out, err := json.Marshal(m)
+	if err != nil {
+		return data
+	}
+	return out
+}
+
 func buildCoreConfig(configPath string) (*core.Config, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, err
 	}
+	data = injectAccessLog(data)
 
 	pbConfig, err := confserial.LoadJSONConfig(bytes.NewReader(data))
 	if err != nil {
