@@ -49,6 +49,9 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.0 (2026-07-21)
+- 🛠️ fix: 配置文件读取Int转bool失败
+
 ### v0.3.9 (2026-07-21)
 - 🌈 支持tcping与icmping
 - 🌈 支持xray日志查看
