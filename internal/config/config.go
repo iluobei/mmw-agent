@@ -1,9 +1,11 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"mmw-agent/internal/constants"
@@ -13,6 +15,42 @@ import (
 )
 
 const AgentUserAgent = constants.AgentUserAgent
+
+// FlexBool 是宽容的布尔:除 true/false 外还接受 1/0、"1"/"0"、yes/no、on/off。
+//
+// 为什么不能直接用 bool:agent 自己的 persistConfigField 曾把 xray_authorized 写成 `1`(int),
+// 而字段类型是 *bool —— **自己写进去的值自己读不回来**。重启即
+// `cannot unmarshal !!int '1' into bool`,systemd 无限重启(现场见过重启计数 900+)。
+//
+// 写入侧已改成写 true/false,但存量机器上的 config.yaml 里仍是 `1`,而且 agent 已经崩了、
+// 主控推不动它,只能靠读取侧兼容才能自愈——否则每台机器都得人工 SSH 改文件。
+type FlexBool bool
+
+func (b *FlexBool) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("期望标量布尔值,得到 %v", node.Kind)
+	}
+	switch strings.ToLower(strings.TrimSpace(node.Value)) {
+	case "1", "true", "yes", "y", "on", "t":
+		*b = true
+	case "0", "false", "no", "n", "off", "f", "", "~", "null":
+		*b = false
+	default:
+		return fmt.Errorf("无法解析为布尔值: %q", node.Value)
+	}
+	return nil
+}
+
+// MarshalYAML 始终输出规范的 true/false,避免再写出歧义值。
+func (b FlexBool) MarshalYAML() (interface{}, error) { return bool(b), nil }
+
+// Bool 安全解引用:nil 时返回 def。
+func (b *FlexBool) Bool(def bool) bool {
+	if b == nil {
+		return def
+	}
+	return bool(*b)
+}
 
 // Config 保存 agent 的运行配置。
 type Config struct {
@@ -31,11 +69,11 @@ type Config struct {
 	LogPath               string        `yaml:"log_path"` // 日志文件路径，默认 /var/log/mmw-agent/mmw-agent.log
 	// HidePortOnWS 开启时:WS 连接可用期间关闭入站监听端口(隐藏 agent),WS 断开时立即重开以保证
 	// 主控 HTTP/pull 回退可达。*bool 区分"未配置"(默认 true)与显式 false。
-	HidePortOnWS *bool `yaml:"hide_port_on_ws"`
+	HidePortOnWS *FlexBool `yaml:"hide_port_on_ws"`
 	// XrayAuthorized 是主控按许可证「服务器配额」下发的运行授权:超出配额的服务器为 false → agent 停 xray。
 	// 主控通过 config_update 下发并由 agent 落盘,重启时据此决定是否启动 xray(实现「重启立即检查」)。
 	// *bool 区分"未配置/首次启动"(nil = 默认授权,先跑)与主控显式判定的 true/false。
-	XrayAuthorized *bool `yaml:"xray_authorized"`
+	XrayAuthorized *FlexBool `yaml:"xray_authorized"`
 }
 
 // DefaultLogPath 是 agent 日志文件默认路径（lumberjack 在同目录轮转生成备份）。
@@ -113,7 +151,7 @@ func fromEnvRaw() *Config {
 		}
 	}
 	if v := os.Getenv("MMWX_HIDE_PORT_ON_WS"); v != "" {
-		b := v == "1" || v == "true"
+		b := FlexBool(v == "1" || v == "true")
 		config.HidePortOnWS = &b
 	}
 
@@ -199,7 +237,7 @@ func (c *Config) applyDefaults() {
 		c.LogPath = DefaultLogPath
 	}
 	if c.HidePortOnWS == nil {
-		v := true
+		v := FlexBool(true)
 		c.HidePortOnWS = &v
 	}
 

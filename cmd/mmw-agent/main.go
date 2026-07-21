@@ -295,7 +295,7 @@ func main() {
 	// 许可证配额授权:主控上次判定本机是否在服务器配额内。超额时主控下发 xray_authorized=0 并由 agent 落盘,
 	// 重启时据此决定是否拉起 xray(「重启立即检查」)。nil/未配置 = 首次或默认 → 授权先跑;
 	// 连上主控后由 handleConfigUpdate 的 xray_authorized 分支校正到最新值。
-	xrayAuthorized := cfg.XrayAuthorized == nil || *cfg.XrayAuthorized
+	xrayAuthorized := cfg.XrayAuthorized.Bool(true)
 	if !xrayAuthorized {
 		log.Printf("[Main] 许可证配额:本机上次被主控判定为超额(xray_authorized=0),启动时不拉起 xray,等待主控重新授权")
 	}
@@ -505,7 +505,7 @@ func main() {
 
 	// 端口隐身:WS 可用期间关闭入站监听,让外部扫描探测不到 agent;主控指令此时走 WS 反向 RPC,
 	// 入站端口仅 WS 不可用时的 HTTP/pull 回退需要。钩子在 Start 之前注入,避免 WS 抢先连上时漏挂。
-	if cfg.HidePortOnWS != nil && *cfg.HidePortOnWS {
+	if cfg.HidePortOnWS.Bool(false) {
 		agentClient.SetListenGateHooks(gate.onWSConnected, gate.onWSDisconnected)
 		log.Printf("[Main] WS-stealth enabled: inbound :%s closes while WebSocket is connected", cfg.ListenPort)
 	}

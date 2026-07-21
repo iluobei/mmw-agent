@@ -2435,13 +2435,13 @@ func (c *Client) handleConfigUpdate(updates map[string]string) {
 	// 当前值 nil(首次/未配置)视为已授权 true。
 	if raw, ok := updates["xray_authorized"]; ok {
 		authorized := raw == "1" || strings.EqualFold(raw, "true")
-		cur := true
-		if c.config.XrayAuthorized != nil {
-			cur = *c.config.XrayAuthorized
-		}
+		cur := c.config.XrayAuthorized.Bool(true)
 		if authorized != cur {
-			c.config.XrayAuthorized = &authorized
-			if err := c.persistConfigField("xray_authorized", boolFlag(authorized)); err != nil {
+			flex := config.FlexBool(authorized)
+			c.config.XrayAuthorized = &flex
+			// 必须写 true/false:字段类型是布尔,写 "1" 的话下次启动 yaml 解析直接失败
+			// (cannot unmarshal !!int `1` into bool)→ systemd 无限重启。
+			if err := c.persistConfigField("xray_authorized", strconv.FormatBool(authorized)); err != nil {
 				log.Printf("[Agent] Failed to persist xray_authorized: %v", err)
 			} else {
 				log.Printf("[Agent] xray_authorized changed to %v (license quota)", authorized)
@@ -2453,14 +2453,6 @@ func (c *Client) handleConfigUpdate(updates map[string]string) {
 	}
 
 	c.handleProbeConfigUpdate(updates)
-}
-
-// boolFlag 把 bool 转成配置持久化用的 "1"/"0"。
-func boolFlag(b bool) string {
-	if b {
-		return "1"
-	}
-	return "0"
 }
 
 // handleProbeConfigUpdate 解析伪装探针采集配置(4 子开关 + ping 目标 + 间隔)。
