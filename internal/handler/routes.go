@@ -29,6 +29,7 @@ func RegisterChildRoutes(mux *http.ServeMux, apiHandler *APIHandler, manageHandl
 	mux.HandleFunc(constants.PathChildSystemInfo, manageHandler.HandleSystemInfo)
 	mux.HandleFunc(constants.PathChildSystemNICs, manageHandler.HandleSystemNICs)
 	mux.HandleFunc(constants.PathChildLogs, manageHandler.HandleGetLogs)
+	mux.HandleFunc(constants.PathChildLogFiles, manageHandler.HandleLogFiles)
 	mux.HandleFunc(constants.PathChildInbounds, manageHandler.HandleInbounds)
 	mux.HandleFunc(constants.PathChildOutbounds, manageHandler.HandleOutbounds)
 	mux.HandleFunc(constants.PathChildRouting, manageHandler.HandleRouting)
