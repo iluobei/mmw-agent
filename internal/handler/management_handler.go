@@ -2140,7 +2140,7 @@ func mergeInboundClients(dst, src map[string]interface{}) {
 	switch strings.ToLower(proto) {
 	case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
 		arrKey = "clients"
-	case "anytls", "snell":
+	case "anytls", "snell", "mieru":
 		arrKey = "users"
 	case "socks", "http":
 		arrKey = "accounts"
@@ -2692,7 +2692,7 @@ func (h *ManageHandler) manageInboundClient(w http.ResponseWriter, ctx context.C
 	switch strings.ToLower(protocol) {
 	case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
 		arrKey = "clients"
-	case "anytls", "snell":
+	case "anytls", "snell", "mieru":
 		arrKey = "users"
 	case "socks", "http":
 		arrKey = "accounts"
@@ -2970,6 +2970,8 @@ func matchClientCredential(a, b map[string]interface{}, protocol string) bool {
 		primaryKey = "password"
 	case "snell":
 		primaryKey = "psk"
+	case "mieru":
+		primaryKey = "username"
 	case "hysteria":
 		primaryKey = "auth"
 	case "socks", "http":
@@ -3538,12 +3540,26 @@ func (h *ManageHandler) manageRouting(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.RestartXray(); err != nil {
-		log.Printf("[Manage] Routing 更新后重启 Xray 失败: %v", err)
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"success": true,
-			"message": "Routing updated but xray restart failed: " + err.Error(),
-			"warning": "restart_failed",
-		})
+		// 关键防呆:新 routing 配置让 xray 起不来 → 若不回滚,坏配置持久化在磁盘上,之后每次重启
+		// 都读到它、xray 永远起不来(gRPC API 死掉 → 所有出站添加报 "connection reset by peer")。
+		// 现象:重启 xray 无效、只能手动删掉那条路由出站。这里回滚到改动前的可用配置并重启,
+		// 保证一次坏改动不会把 agent 弄挂;并返回错误(而非旧版 success:true),让主控知晓失败。
+		log.Printf("[Manage] Routing 更新后重启 Xray 失败,回滚到旧配置: %v", err)
+		rolledBack := false
+		if werr := os.WriteFile(configPath, content, 0644); werr != nil {
+			log.Printf("[Manage] 回滚写旧配置失败: %v", werr)
+		} else if rerr := h.RestartXray(); rerr != nil {
+			log.Printf("[Manage] 回滚后重启 Xray 仍失败(旧配置可能本就有问题): %v", rerr)
+		} else {
+			rolledBack = true
+		}
+		msg := "路由更新被拒绝:新配置导致 xray 无法启动。原因: " + err.Error()
+		if rolledBack {
+			msg += "(已回滚到旧配置,xray 已恢复)"
+		} else {
+			msg += "(回滚失败,请检查 agent xray 状态)"
+		}
+		writeError(w, http.StatusInternalServerError, msg)
 		return
 	}
 
@@ -3611,7 +3627,7 @@ func applyAddClientToConfig(config map[string]interface{}, tag string, client ma
 		switch strings.ToLower(protocol) {
 		case "vless", "vmess", "trojan", "shadowsocks", "hysteria":
 			arrKey = "clients"
-		case "anytls", "snell":
+		case "anytls", "snell", "mieru":
 			arrKey = "users"
 		case "socks", "http":
 			arrKey = "accounts"
@@ -3812,8 +3828,20 @@ func (h *ManageHandler) HandleBatchApply(w http.ResponseWriter, r *http.Request)
 	// routing 改动需要 xray restart 才能生效;NoRestart=true 时由 caller 统一末尾重启。
 	if routingChanged && !req.NoRestart {
 		if err := h.RestartXray(); err != nil {
-			log.Printf("[BatchApply] restart xray failed: %v", err)
-			result.Message = "config persisted, xray restart failed: " + err.Error()
+			// 同 manageRouting 的防呆:坏配置让 xray 起不来时回滚到旧配置并重启,避免持久化坏配置把
+			// agent 弄挂(否则 gRPC API 死掉、所有出站添加报 connection reset,重启无效只能手删)。
+			log.Printf("[BatchApply] restart xray failed, rolling back: %v", err)
+			rolledBack := false
+			if werr := os.WriteFile(configPath, content, 0644); werr == nil {
+				if rerr := h.RestartXray(); rerr == nil {
+					rolledBack = true
+				}
+			}
+			if rolledBack {
+				result.Message = "routing change rejected: new config failed to start xray, rolled back: " + err.Error()
+			} else {
+				result.Message = "config persisted, xray restart failed (rollback also failed): " + err.Error()
+			}
 		} else {
 			result.RestartedXray = true
 		}
