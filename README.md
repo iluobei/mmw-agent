@@ -49,6 +49,11 @@ curl -sL https://raw.githubusercontent.com/iluobei/mmw-agent/main/install.sh | b
 <details>
 <summary>更新日志</summary>
 
+### v0.4.1 (2026-07-23)
+- 🌈 支持内置icmping
+- 🌈 支持日志管理与删除
+- 🛠️ fix: 限速延迟生效
+
 ### v0.4.0 (2026-07-21)
 - 🛠️ fix: 配置文件读取Int转bool失败
 
