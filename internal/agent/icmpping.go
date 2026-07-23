@@ -160,3 +160,17 @@ func icmpPing(host string, timeout time.Duration) (time.Duration, error) {
 		}
 	}
 }
+
+// ICMPPing / ICMPAvailable 是 icmpPing / icmpAvailable 的导出包装,供 handler 包复用
+// (domains/latency 在所有候选 TCP 端口都拨不通时降级到 ICMP)。
+//
+// 用包装而不是把原函数改成大写:regionping.go 等既有调用点保持不动,改动面最小。
+func ICMPPing(host string, timeout time.Duration) (time.Duration, error) {
+	return icmpPing(host, timeout)
+}
+
+// ICMPAvailable 报告本机能否发 ICMP(需要 root 或 ping_group_range 放开)。
+// 不可用时调用方应保持 TCP 结论,不要把"发不出 ICMP"当成"目标不通"。
+func ICMPAvailable() bool {
+	return icmpAvailable()
+}

@@ -10,12 +10,18 @@ import (
 	"sync"
 	"time"
 
+	"mmw-agent/internal/agent"
 	"mmw-agent/internal/constants"
 )
 
 type DomainLatencyProbeRequest struct {
 	Domains   []string `json:"domains"`
 	TimeoutMs int      `json:"timeout_ms,omitempty"`
+	// AllowICMP:所有候选端口都拨不通时,再用 ICMP 探一次主机可达性。
+	// 用于"目标机上没有任何已知在监听的端口"的场景(全新服务器、agent 开了端口隐身)——
+	// 那时 TCP 失败并不代表网络不通,不降级就只能给出误导性的"不通"。
+	// 老主控不带这个字段 → 默认 false → 行为与之前完全一致。
+	AllowICMP bool `json:"allow_icmp,omitempty"`
 }
 
 type DomainLatencyProbeResult struct {
@@ -24,6 +30,9 @@ type DomainLatencyProbeResult struct {
 	Success   bool   `json:"success"`
 	LatencyMs int64  `json:"latency_ms,omitempty"`
 	Error     string `json:"error,omitempty"`
+	// Method 标明这条结果是怎么测出来的:"tcp"(默认)或 "icmp"(TCP 全失败后的降级)。
+	// 主控据此在 UI 上区分"端口通"与"主机通但端口未验证"。
+	Method string `json:"method,omitempty"`
 }
 
 // 处理 POST /api/child/domains/latency 请求。
@@ -82,7 +91,7 @@ func (h *ManageHandler) HandleDomainLatencyProbe(w http.ResponseWriter, r *http.
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			resultCh <- probeOneDomainLatency(domain, timeout)
+			resultCh <- probeOneDomainLatency(domain, timeout, req.AllowICMP)
 		}()
 	}
 
@@ -157,7 +166,7 @@ func normalizeProbeInput(raw string) string {
 	return s
 }
 
-func probeOneDomainLatency(domain string, timeout time.Duration) DomainLatencyProbeResult {
+func probeOneDomainLatency(domain string, timeout time.Duration, allowICMP bool) DomainLatencyProbeResult {
 	host := domain
 	port := "443"
 
@@ -178,21 +187,38 @@ func probeOneDomainLatency(domain string, timeout time.Duration) DomainLatencyPr
 	target := net.JoinHostPort(host, port)
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", target, timeout)
-	if err != nil {
+	if err == nil {
+		_ = conn.Close()
 		return DomainLatencyProbeResult{
-			Domain:  host,
-			Target:  target,
-			Success: false,
-			Error:   err.Error(),
+			Domain:    host,
+			Target:    target,
+			Success:   true,
+			LatencyMs: time.Since(start).Milliseconds(),
+			Method:    "tcp",
 		}
 	}
-	_ = conn.Close()
+
+	// TCP 不通 → 按需降级 ICMP:回答"主机是否可达"而不是"这个端口是否开着"。
+	// 环境不支持发 ICMP(非 root 且 ping_group_range 没放开)时保持 TCP 结论,
+	// 不把"发不出 ICMP"误报成别的东西。
+	if allowICMP && agent.ICMPAvailable() {
+		if rtt, ierr := agent.ICMPPing(host, timeout); ierr == nil {
+			return DomainLatencyProbeResult{
+				Domain:    host,
+				Target:    target,
+				Success:   true,
+				LatencyMs: rtt.Milliseconds(),
+				Method:    "icmp",
+			}
+		}
+	}
 
 	return DomainLatencyProbeResult{
-		Domain:    host,
-		Target:    target,
-		Success:   true,
-		LatencyMs: time.Since(start).Milliseconds(),
+		Domain:  host,
+		Target:  target,
+		Success: false,
+		Error:   err.Error(),
+		Method:  "tcp",
 	}
 }
 
