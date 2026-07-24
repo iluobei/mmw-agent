@@ -60,3 +60,32 @@ func nginxStop() error {
 	}
 	return exec.Command("systemctl", "stop", "nginx").Run()
 }
+
+// nginxControl 控制 nginx 服务。Docker 容器没有 systemd，直接控制 nginx 进程；
+// 裸机仍然使用 systemctl。
+func nginxControl(action string) error {
+	switch action {
+	case "start":
+		if nginxIsActive() {
+			return nil
+		}
+		return nginxStart()
+	case "stop":
+		if !nginxIsActive() {
+			return nil
+		}
+		return nginxStop()
+	case "restart":
+		if util.IsDocker() {
+			if !nginxIsActive() {
+				return nginxStart()
+			}
+			if bin := findNginxBinary(); bin != "" {
+				return exec.Command(bin, "-s", "reload").Run()
+			}
+			return exec.Command("nginx", "-s", "reload").Run()
+		}
+		return exec.Command("systemctl", "restart", "nginx").Run()
+	}
+	return nil
+}

@@ -588,6 +588,11 @@ func (h *ManageHandler) HandleServiceControl(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("启动 xray 失败: %v %s", err, serviceFailureDetail("xray")))
 			return
 		}
+	} else if req.Service == "nginx" {
+		if err := nginxControl(req.Action); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s nginx 失败: %v | %s", req.Action, err, serviceFailureDetail("nginx")))
+			return
+		}
 	} else {
 		cmd := exec.Command("systemctl", req.Action, req.Service)
 		output, err := cmd.CombinedOutput()
@@ -5115,6 +5120,9 @@ func detectNginxConfDirFromBinary() string {
 }
 
 func reloadNginx() error {
+	if util.IsDocker() && !nginxIsActive() {
+		return nginxStart()
+	}
 	for _, bin := range constants.NginxBinarySearchPaths {
 		if path, err := exec.LookPath(bin); err == nil {
 			return runCommand(path, "-s", "reload")

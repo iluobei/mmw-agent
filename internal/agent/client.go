@@ -2061,6 +2061,9 @@ func deployCert(certPEM, keyPEM, certPath, keyPath, reloadTarget string) error {
 func reloadNginxCmd() error {
 	for _, bin := range constants.NginxBinarySearchPaths {
 		if path, err := exec.LookPath(bin); err == nil {
+			if util.IsDocker() && exec.Command("pgrep", "-x", "nginx").Run() != nil {
+				return runCmd(path)
+			}
 			return runCmd(path, "-s", "reload")
 		}
 	}
