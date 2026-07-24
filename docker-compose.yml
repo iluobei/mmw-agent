@@ -16,7 +16,7 @@ services:
       # 主控地址(必填)
       - MMWX_MASTER_URL=https://master.example.com
       # 主控添加 server 时给的 token(必填)
-      - MMWX_MASTER_TOKEN=<填写主控端生成的 agent token>
+      - MMWX_TOKEN=<填写主控端生成的 agent token>
       # 强制 embedded — Docker 镜像不含外部 xray binary,只能 embedded
       - MMWX_XRAY_MODE=embedded
       # 容器探测(Dockerfile 已经设了,这里写一遍兜底)

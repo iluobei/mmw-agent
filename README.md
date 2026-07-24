@@ -15,7 +15,7 @@ docker run -d \
   --restart unless-stopped \
   -e MMWX_LISTEN_PORT=12888 \
   -e MMWX_MASTER_URL=https://master.example.com \
-  -e MMWX_MASTER_TOKEN=<主控生成的 token> \
+  -e MMWX_TOKEN=<主控生成的 token> \
   -v $(pwd)/config:/etc/mmw-agent \
   -v $(pwd)/xray-config:/usr/local/etc/xray \
   -v $(pwd)/nginx-cert:/etc/nginx/cert \
@@ -252,7 +252,7 @@ go build -ldflags="-s -w" -o mmw-agent ./cmd/mmw-agent
 
 # 运行（环境变量方式）
 MMWX_MASTER_URL=https://master.example.com \
-MMWX_MASTER_TOKEN=your-token \
+MMWX_TOKEN=your-token \
 ./mmw-agent
 ```
 
@@ -278,7 +278,7 @@ xray_servers:                    # 可选，不配则自动发现
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `MMWX_MASTER_URL` | 主控地址 | — |
-| `MMWX_MASTER_TOKEN` | 服务器令牌 | — |
+| `MMWX_TOKEN` | 服务器令牌 | — |
 | `MMWX_CONNECTION_MODE` | 连接模式 | `auto` |
 | `MMWX_LISTEN_PORT` | 监听端口 | `23889` |
 | `MMWX_CHILD_API_TOKEN` | Pull API 认证令牌 | — |
